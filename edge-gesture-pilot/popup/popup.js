@@ -30,6 +30,7 @@ const state = {
   error: null,       // 刚从后台返回的即时错误，优先级高于 storage 里的历史失败
   stale: false,      // 后台 service worker 的版本与界面不一致 —— 说明该重新加载扩展
   bgVersion: null,
+  renaming: null,    // 正在改名的脚本 id（列表里会切换成输入框）
   triggerLog: {},    // 每个脚本上次页面触发的时间
   activeUrl: '',     // 当前标签页 URL，用来实时提示「当前页面匹不匹配」
   open: new Set(),   // 展开的脚本 id
@@ -38,6 +39,14 @@ const state = {
 
 /** popup 自己这份 bundle 的版本 */
 const LOCAL_VERSION = chrome.runtime.getManifest?.()?.version || '?';
+
+/** 导出文件的格式标记，导入时会校验 */
+const FORMAT = 'gesture-pilot-scripts';
+
+/** 脚本名里可能有斜杠、冒号之类不能进文件名的字符 */
+function sanitizeName(name) {
+  return String(name || 'script').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40) || 'script';
+}
 
 /** 后端返回的报错串像「未定义标识符」时，基本就是后台还在跑旧代码 */
 function looksLikeStaleBackend(msg) {
@@ -111,6 +120,37 @@ function triggerText(s) {
   if (t.requireVisible) bits.push('等前台');
   const scope = describePatterns(t.domains);
   return `触发：${scope}${bits.length ? ` · ${bits.join(' + ')}` : ''}`;
+}
+
+function scheduleDomainsText(sch) {
+  const d = sch?.domains || [];
+  return d.length ? `限 ${describePatterns(d)}` : '';
+}
+
+/** 把对象导出成 JSON 文件下载下来（popup 里用 blob 直下，不依赖 downloads 权限） */
+function downloadJson(filename, data) {
+  try {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.style.display = 'none';
+    (document.body || document.documentElement).appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    return true;
+  } catch (e) {
+    showBannerError(`导出失败：${e?.message || e}`);
+    return false;
+  }
+}
+
+function exportFilename(prefix) {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${prefix}-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.json`;
 }
 
 function locatorText(step) {
@@ -223,24 +263,39 @@ function renderList() {
       const isOpen = state.open.has(s.id);
       const isRunning = state.run?.status === 'running' && state.run.scriptId === s.id;
       const isFailed = state.run?.status === 'failed' && state.run.scriptId === s.id;
-      const cls = ['card', isRunning && 'running', isFailed && 'failed'].filter(Boolean).join(' ');
+      const off = s.enabled === false;
+
+      const cls = ['card', isRunning && 'running', isFailed && 'failed', off && 'off']
+        .filter(Boolean)
+        .join(' ');
 
       const sched = s.schedule || {};
-      const tagCls = sched.enabled ? 'tag' : 'tag off';
+      const tagCls = sched.enabled && !off ? 'tag' : 'tag off';
+      const trig = off ? '' : triggerText(s);
+
+      // 点标题直接改名；正在改的这个不要重新渲染成静态文本，否则光标会跳走
+      const title =
+        state.renaming === s.id
+          ? `<input class="rename" value="${esc(s.name)}" maxlength="80" placeholder="脚本名称" />`
+          : `<span class="txt">${esc(s.name)}</span><span class="pen" title="点击改名">✎</span>`;
 
       return `
 <div class="${cls}" data-id="${s.id}">
   <div class="card-hd" data-act="toggle">
+    <input type="checkbox" class="en" data-act="enabled" ${off ? '' : 'checked'}
+      title="启用 / 停用（停用后定时与页面触发都不再生效，手动仍可运行）" />
     <div class="meta">
-      <div class="name">${esc(s.name)}</div>
+      <div class="name" data-act="rename" title="点击改名">${title}</div>
       <div class="sub">
-        <span class="${tagCls}">${esc(scheduleText(sched))}</span>
-        ${s.steps.length} 步 · ${esc(hostOf(s.targetUrl))} · ${s.engine ? esc(s.engine) : '默认引擎'}${triggerText(s) ? ` · ${esc(triggerText(s))}` : ''}
+        <span class="${tagCls}">${off ? '已停用' : esc(scheduleText(sched))}</span>
+        ${s.steps.length} 步 · ${esc(hostOf(s.targetUrl))} · ${s.engine ? esc(s.engine) : '默认引擎'}
+        ${trig ? ` · ${esc(trig)}` : ''}
+        ${trig || off ? '' : (scheduleDomainsText(sched) ? ` · ${esc(scheduleDomainsText(sched))}` : '')}
       </div>
     </div>
     <div class="acts">
       <button class="btn" data-act="run" ${isRunning ? 'disabled' : ''}>${isRunning ? '执行中' : '运行'}</button>
-      <button class="btn" data-act="toggle">${isOpen ? '收起' : '详情'}</button>
+      <button class="btn" data-act="toggle">${isOpen ? '收起' : '配置'}</button>
       <button class="btn icon" data-act="del" title="删除">✕</button>
     </div>
   </div>
@@ -250,7 +305,6 @@ function renderList() {
     .join('');
 }
 
-/** 触发条件编辑区 */
 function triggerBlock(s) {
   const t = normalizeTrigger(s.trigger);
   const log = state.triggerLog?.[s.id];
@@ -300,65 +354,93 @@ function triggerBlock(s) {
 </div>`;
 }
 
+/** 单步编辑行：420px 宽度下用两行才排得开 */
+function stepRow(st, i, total) {
+  const kind = KIND[st.type] || st.type;
+  const editable = st.type === 'input' || st.type === 'select' || st.type === 'wait';
+  const val = st.type === 'wait' ? (st.value ?? 1000) : (st.value ?? '');
+
+  const valueCell = editable
+    ? `<input class="val" type="text" data-step="${i}" value="${esc(val)}"
+         placeholder="${st.type === 'wait' ? '毫秒' : '值'}" />`
+    : `<span class="sel" title="${esc(stepDetail(st))}">${esc(stepDetail(st))}</span>`;
+
+  return `
+<div class="step">
+  <div class="step-l1">
+    <span class="idx">${i + 1}</span>
+    <span class="kind ${st.type}">${kind}</span>
+    <span class="sel" title="${esc(locatorText(st))}">${esc(locatorText(st))}</span>
+  </div>
+  <div class="step-l2">
+    ${valueCell}
+    <span class="dly">延时<input type="number" min="0" step="50" data-delay="${i}"
+      value="${Math.max(0, Number(st.delay) || 0)}" />ms</span>
+    <span class="ops">
+      <button data-up="${i}" title="上移" ${i === 0 ? 'disabled' : ''}>↑</button>
+      <button data-down="${i}" title="下移" ${i === total - 1 ? 'disabled' : ''}>↓</button>
+      <button data-dup="${i}" title="复制这一步">＋</button>
+      <button data-del="${i}" title="删除这一步">✕</button>
+    </span>
+  </div>
+</div>`;
+}
+
 function cardBody(s) {
-  const sch = s.schedule || { enabled: false, mode: 'interval', everySec: 1800, time: '09:30' };
+  const sch = s.schedule || {};
   const everySec = Number(sch.everySec) || 1800;
   const useSeconds = everySec < 60;
   const amount = useSeconds ? everySec : Math.round(everySec / 60);
+  const daily = sch.mode === 'daily';
 
-  const steps = s.steps
-    .map((st, i) => {
-      const editable = st.type === 'input' || st.type === 'select' || st.type === 'wait';
-      return `
-<div class="step">
-  <span class="idx">${i + 1}</span>
-  <span class="kind ${st.type}">${KIND[st.type] || st.type}</span>
-  <span class="sel" title="${esc(locatorText(st))}">${esc(locatorText(st))}</span>
-  ${
-    editable
-      ? `<input class="val" type="text" value="${esc(st.type === 'wait' ? st.value ?? 1000 : st.value ?? '')}" data-step="${i}" placeholder="值" />`
-      : `<span class="sel" style="flex:none;width:104px;text-align:right">${esc(stepDetail(st))}</span>`
-  }
-  <button class="del" data-del="${i}" title="删除该步">✕</button>
-</div>`;
-    })
-    .join('');
+  const steps = s.steps.map((st, i) => stepRow(st, i, s.steps.length)).join('');
 
   return `
 <div class="card-bd">
+  <div class="field" style="margin-bottom:8px">
+    <label for="nm-${s.id}">脚本名称</label>
+    <input id="nm-${s.id}" type="text" data-name value="${esc(s.name)}" maxlength="80" placeholder="给脚本起个名字" />
+  </div>
+
   <div class="sched">
     <label class="sw"><input type="checkbox" data-sched="enabled" ${sch.enabled ? 'checked' : ''} /> 定时自动执行</label>
     <div class="row">
-      <select data-sched="mode" style="width:82px">
-        <option value="interval" ${sch.mode !== 'daily' ? 'selected' : ''}>每隔</option>
-        <option value="daily" ${sch.mode === 'daily' ? 'selected' : ''}>每天</option>
+      <select data-sched="mode" style="width:76px">
+        <option value="interval" ${daily ? '' : 'selected'}>每隔</option>
+        <option value="daily" ${daily ? 'selected' : ''}>每天</option>
       </select>
-      <input type="number" data-sched="amount" min="1" value="${amount}" style="width:70px" ${sch.mode === 'daily' ? 'disabled' : ''} />
-      <select data-sched="unit" style="width:70px" ${sch.mode === 'daily' ? 'disabled' : ''}>
-        <option value="60" ${!useSeconds ? 'selected' : ''}>分钟</option>
+      <input type="number" data-sched="amount" min="1" value="${amount}" style="width:62px" ${daily ? 'disabled' : ''} />
+      <select data-sched="unit" style="width:64px" ${daily ? 'disabled' : ''}>
+        <option value="60" ${useSeconds ? '' : 'selected'}>分钟</option>
         <option value="1" ${useSeconds ? 'selected' : ''}>秒</option>
       </select>
-      <input type="time" data-sched="time" value="${esc(sch.time || '09:30')}" ${sch.mode === 'daily' ? '' : 'disabled'} />
+      <input type="time" data-sched="time" value="${esc(sch.time || '09:30')}" ${daily ? '' : 'disabled'} />
     </div>
-    <div class="row" style="margin:0">
-      回放引擎
-      <select data-sched="engine" style="width:150px;margin-left:auto">
-        <option value="" ${!s.engine ? 'selected' : ''}>跟随全局设置</option>
-        <option value="synthetic" ${s.engine === 'synthetic' ? 'selected' : ''}>合成事件</option>
-        <option value="cdp" ${s.engine === 'cdp' ? 'selected' : ''}>CDP 真实输入</option>
-      </select>
+    <div class="row" style="margin:6px 0 0">
+      <span>生效域名</span>
+      <input type="text" data-sched="domains" value="${esc((sch.domains || []).join(', '))}"
+        placeholder="留空 = 不限" style="flex:1" />
+    </div>
+    <div class="row" style="margin:3px 0 0">
+      <span class="dim">只约束「定时」这条路径；跑到范围外的页面会跳过并通知你</span>
     </div>
   </div>
 
   ${triggerBlock(s)}
 
-  <div class="steps">${steps || '<div class="step">没有步骤</div>'}</div>
+  <div class="steps">
+    ${steps || '<div class="step"><span class="dim">没有步骤</span></div>'}
+    <div class="steps-foot">
+      <button class="btn" data-act="add-wait">＋ 插入等待</button>
+      <span class="dim" style="margin-left:auto;align-self:center">共 ${s.steps.length} 步</span>
+    </div>
+  </div>
 
   <div class="row" style="margin:8px 0 0">
     <button class="btn" data-act="copy">复制 JSON</button>
+    <button class="btn" data-act="export">导出此脚本</button>
     <button class="btn" data-act="dup">创建副本</button>
     <button class="btn" data-act="run" ${state.run?.status === 'running' ? 'disabled' : ''}>立即运行</button>
-    <span style="margin-left:auto;color:var(--ink-3)">共 ${s.steps.length} 步</span>
   </div>
 </div>`;
 }
@@ -424,12 +506,36 @@ async function saveSchedule(id, patch) {
     next.schedule.everySec = Math.max(1, Math.round(next.schedule.everySec));
   }
   s.schedule = next.schedule;
-  await api({ type: 'SCRIPT_UPDATE', script: next });
+  const r = await api({ type: 'SCRIPT_UPDATE', script: next });
+  // 后台会做规范化（补默认值、解析域名文本），以它的结果为准
+  if (r?.ok && r.script) s.schedule = r.script.schedule;
   render();
 }
 
+/** 步骤级编辑：上移 / 下移 / 复制 / 删除。返回是否真的改动了 */
+function moveStep(s, i, dir) {
+  const j = i + dir;
+  if (!Number.isInteger(i) || i < 0 || i >= s.steps.length) return false;
+  if (j < 0 || j >= s.steps.length) return false;
+  const [st] = s.steps.splice(i, 1);
+  s.steps.splice(j, 0, st);
+  return true;
+}
+
+function duplicateStep(s, i) {
+  const st = s.steps[i];
+  if (!st) return false;
+  s.steps.splice(i + 1, 0, structuredClone(st));
+  return true;
+}
+
 async function persistScript(s) {
-  await api({ type: 'SCRIPT_UPDATE', script: s });
+  const r = await api({ type: 'SCRIPT_UPDATE', script: s });
+  if (r?.ok && r.script) {
+    // 用后台规范化后的结果覆盖本地，避免界面显示出存储里并不存在的字段
+    Object.assign(s, r.script);
+  }
+  return r;
 }
 
 /* ================= 事件 ================= */
@@ -472,17 +578,75 @@ $('#list').addEventListener('click', async (e) => {
   const s = state.scripts.find((x) => x.id === id);
   if (!s) return;
 
-  const del = e.target.closest('[data-del]');
-  if (del) {
-    const i = Number(del.dataset.del);
-    s.steps.splice(i, 1);
-    await persistScript(s);
-    render();
+  // ---- 步骤级操作（必须放在 data-act 之前判断，它们不在 [data-act] 上）----
+  const stepBtn =
+    e.target.closest('[data-up]') ||
+    e.target.closest('[data-down]') ||
+    e.target.closest('[data-dup]') ||
+    e.target.closest('[data-del]');
+
+  if (stepBtn) {
+    e.stopPropagation();
+    const d = stepBtn.dataset;
+    let changed = false;
+    if (d.up !== undefined) changed = moveStep(s, Number(d.up), -1);
+    else if (d.down !== undefined) changed = moveStep(s, Number(d.down), 1);
+    else if (d.dup !== undefined) changed = duplicateStep(s, Number(d.dup));
+    else if (d.del !== undefined) {
+      const i = Number(d.del);
+      if (i >= 0 && i < s.steps.length) {
+        s.steps.splice(i, 1);
+        changed = true;
+      }
+    }
+    if (changed) {
+      await persistScript(s);
+      render();
+    }
     return;
   }
 
   const act = e.target.closest('[data-act]')?.dataset.act;
   if (!act) return;
+
+  if (act === 'enabled') return; // 复选框交给 change 事件处理
+
+  if (act === 'rename') {
+    e.stopPropagation();
+    // 已经在改名就别再重渲染，否则输入框会被重建、光标跳走
+    if (state.renaming !== id) {
+      state.renaming = id;
+      render();
+      const input = document.querySelector(`.card[data-id="${id}"] input.rename`);
+      try {
+        input?.focus?.();
+        input?.select?.();
+      } catch {
+        /* 忽略 */
+      }
+    }
+    return;
+  }
+
+  if (act === 'add-wait') {
+    e.stopPropagation();
+    s.steps.push({ type: 'wait', value: 1000, delay: 0 });
+    await persistScript(s);
+    render();
+    return;
+  }
+
+  if (act === 'export') {
+    e.stopPropagation();
+    if (downloadJson(exportFilename(sanitizeName(s.name)), { format: FORMAT, version: 1, exportedAt: new Date().toISOString(), scripts: [s] })) {
+      const btn = card.querySelector('[data-act="export"]');
+      if (btn) {
+        btn.textContent = '已导出';
+        setTimeout(() => { const b = card.querySelector('[data-act="export"]'); if (b) b.textContent = '导出此脚本'; }, 1200);
+      }
+    }
+    return;
+  }
 
   if (act === 'toggle') {
     if (state.open.has(id)) state.open.delete(id);
@@ -536,12 +700,41 @@ $('#list').addEventListener('change', async (e) => {
   const s = state.scripts.find((x) => x.id === id);
   if (!s) return;
 
+  // 脚本启停总开关
+  if (e.target.matches('[data-act="enabled"]')) {
+    s.enabled = !!e.target.checked;
+    await persistScript(s);
+    render();
+    return;
+  }
+
+  // 配置区里的名称输入框
+  if (e.target.matches('[data-name]')) {
+    const next = String(e.target.value || '').trim();
+    if (next && next !== s.name) {
+      s.name = next;
+      await persistScript(s);
+      render();
+    }
+    return;
+  }
+
   // 步骤值编辑
   if (e.target.matches('[data-step]')) {
     const i = Number(e.target.dataset.step);
     const st = s.steps[i];
     if (!st) return;
     st.value = st.type === 'wait' ? Number(e.target.value) || 0 : e.target.value;
+    await persistScript(s);
+    return;
+  }
+
+  // 步骤延时（修页面抖动最常用的一项）
+  if (e.target.matches('[data-delay]')) {
+    const i = Number(e.target.dataset.delay);
+    const st = s.steps[i];
+    if (!st) return;
+    st.delay = Math.max(0, Number(e.target.value) || 0);
     await persistScript(s);
     return;
   }
@@ -580,11 +773,33 @@ $('#list').addEventListener('change', async (e) => {
     await saveSchedule(id, { everySec });
   } else if (key === 'time') {
     await saveSchedule(id, { time: e.target.value });
+  } else if (key === 'domains') {
+    await saveSchedule(id, { domains: parseDomainText(e.target.value) });
   } else if (key === 'engine') {
     s.engine = e.target.value || null;
     await persistScript(s);
     render();
   }
+});
+
+/**
+ * 标题改名输入框的收尾。
+ * 用 focusout 而不是 change：change 只在值真的变了才触发，
+ * 用户点开改名又直接点别处时 change 不会来，改名态就会一直卡着。
+ */
+$('#list').addEventListener('focusout', async (e) => {
+  if (!e.target.matches?.('input.rename')) return;
+  const card = e.target.closest('.card');
+  const id = card?.dataset?.id;
+  const s = id ? state.scripts.find((x) => x.id === id) : null;
+  const next = String(e.target.value || '').trim();
+
+  state.renaming = null;
+  if (s && next && next !== s.name) {
+    s.name = next;
+    await persistScript(s);
+  }
+  render();
 });
 
 $('#banner').addEventListener('click', async (e) => {
@@ -605,6 +820,88 @@ $('#pane-settings').addEventListener('change', async (e) => {
   const r = await api({ type: 'SETTINGS_SAVE', patch });
   if (r?.ok) state.settings = { ...DEFAULT_SETTINGS, ...r.settings };
   renderSettings();
+});
+
+/* ================= 备份与恢复 ================= */
+
+function importMsg(text, kind) {
+  const el = $('#importMsg');
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = kind === 'err' ? 'var(--red)' : kind === 'ok' ? 'var(--green)' : 'var(--ink-3)';
+}
+
+/** 兼容两种导出格式：整包 {scripts:[...]} 和单个脚本对象 */
+function extractScripts(parsed) {
+  if (!parsed) return null;
+  if (Array.isArray(parsed)) return parsed;
+  if (Array.isArray(parsed.scripts)) return parsed.scripts;
+  if (Array.isArray(parsed.steps)) return [parsed];
+  return null;
+}
+
+$('#btnExportAll')?.addEventListener('click', () => {
+  if (!state.scripts.length) {
+    showBannerError('还没有任何脚本可以导出');
+    return;
+  }
+  downloadJson(exportFilename('gesture-pilot-all'), {
+    format: FORMAT,
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    count: state.scripts.length,
+    scripts: state.scripts,
+  });
+});
+
+$('#btnPaste')?.addEventListener('click', async () => {
+  const ta = $('#importText');
+  try {
+    const text = await navigator.clipboard.readText();
+    if (!text) {
+      importMsg('剪贴板是空的', 'err');
+      return;
+    }
+    ta.value = text;
+    importMsg(`已粘贴 ${text.length} 个字符，点「导入」生效`, 'ok');
+  } catch {
+    // 剪贴板读取可能被拒，退回手动粘贴
+    importMsg('读不到剪贴板，请手动粘贴到下面的框里', 'err');
+  }
+});
+
+$('#btnImport')?.addEventListener('click', async () => {
+  const text = String($('#importText')?.value || '').trim();
+  if (!text) {
+    importMsg('请先把导出的 JSON 粘贴进来', 'err');
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    importMsg(`JSON 解析失败：${err?.message || err}`, 'err');
+    return;
+  }
+
+  const scripts = extractScripts(parsed);
+  if (!scripts || !scripts.length) {
+    importMsg('没找到脚本数据（需要是本扩展导出的 JSON）', 'err');
+    return;
+  }
+
+  const r = await api({ type: 'SCRIPT_IMPORT', scripts });
+  if (!r?.ok) {
+    importMsg(r?.error || '导入失败', 'err');
+    return;
+  }
+  $('#importText').value = '';
+  importMsg(
+    r.skipped ? `导入 ${r.added} 个，跳过 ${r.skipped} 个（已存在或结构不完整）` : `导入 ${r.added} 个脚本`,
+    'ok',
+  );
+  await refresh();
 });
 
 refresh().catch((e) => {

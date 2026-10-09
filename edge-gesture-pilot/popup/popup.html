@@ -79,6 +79,30 @@
           修改会自动保存。<strong>秒级周期</strong>（&lt; 60 秒）由 offscreen 文档驱动；
           <strong>分钟级及以上</strong>走 chrome.alarms，Service Worker 被回收也不会丢。
         </p>
+
+        <hr class="sep" />
+
+        <h3 class="sect">备份与恢复</h3>
+        <div class="row">
+          <button class="btn" id="btnExportAll">导出全部脚本</button>
+          <button class="btn" id="btnPaste">从剪贴板粘贴</button>
+        </div>
+        <textarea id="importText" rows="4"
+          placeholder="把导出的 JSON 粘贴到这里，再点「导入」"></textarea>
+        <div class="row">
+          <button class="btn" id="btnImport">导入</button>
+          <span class="dim" id="importMsg">同 id 的脚本会跳过，不会覆盖现有配置</span>
+        </div>
+
+        <hr class="sep" />
+
+        <h3 class="sect">快捷键与右键菜单</h3>
+        <p class="hint">
+          <strong>Ctrl+Shift+E</strong> 开始 / 停止录制 ·
+          <strong>Ctrl+Shift+K</strong> 运行当前页面匹配的脚本<br />
+          在页面任意位置右键也能用。改键位去
+          <code>edge://extensions/shortcuts</code>。
+        </p>
       </section>
     </main>
 

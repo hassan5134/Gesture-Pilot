@@ -86,6 +86,44 @@ Expand a script card and tick **Run on a schedule**:
 
 - **Every** — a number plus a unit (seconds / minutes)
 - **Daily** — a time of day. Uses a one-shot alarm that re-arms itself after each run, which handles DST correctly
+- **Domains** — when set, a timed run that lands on a page outside the allowed range is **skipped and reported**, so it never clicks around on the wrong site
+
+### Managing scripts
+
+| Action | How |
+|---|---|
+| **Rename** | Click the card title directly, or edit "Script name" once expanded |
+| **Disable / enable** | The checkbox at the left of the card. Disabling stops timers and page triggers; **manual runs still work** |
+| **Tune step delay** | The "delay xxx ms" box on each step, saved immediately |
+| **Reorder steps** | The `↑` `↓` buttons per step; the ends are disabled automatically |
+| **Duplicate / delete a step** | The `＋` / `✕` buttons per step |
+| **Add a wait** | "＋ Insert wait" at the bottom of the step list, for slow-rendering pages |
+| **Export / import** | Per script via "Export this script"; everything via **Settings → Backup & restore** |
+
+### Keyboard shortcuts and context menu
+
+For when you'd rather not go hunting for the toolbar icon:
+
+| Action | Default |
+|---|---|
+| Start / stop recording | `Ctrl+Shift+E` |
+| Run the script matching the current page | `Ctrl+Shift+K` |
+
+Right-clicking anywhere on a page also gives you **Record / stop this page** and **Run script ▸** (listing every enabled script; past 15 it points you to the panel instead).
+
+Rebind them at `edge://extensions/shortcuts`.
+
+"Run the script matching the current page" picks the first hit in this order: a matching page-trigger rule → a matching schedule domain → a same-origin `targetUrl`. If nothing matches it tells you why rather than **running some arbitrary script**.
+
+### Backup and restore
+
+Under **Settings → Backup & restore**:
+
+- **Export all scripts** — downloads a JSON file with the complete configuration and steps of every script
+- **Paste from clipboard** — fills the box for you (falls back to manual paste if clipboard access is refused)
+- **Import** — validates script by script: **ids that already exist are skipped, never overwritten**, and structurally broken entries are skipped too
+
+Import is additive by design, so re-importing the same backup is idempotent and can't clobber your existing setup.
 
 ### Replay engines
 
@@ -144,7 +182,7 @@ Besides timers, a script can **run automatically when a matching page loads**. C
 | Setting | Description |
 |---|---|
 | **Trigger on page load** | Master switch |
-| **Domains** | Empty = every domain. Separated by commas / semicolons / whitespace |
+| **Domains** | Empty = every domain. Separated by commas / semicolons / whitespace. The schedule section has its own copy — the two paths are independent |
 | **Wait N seconds after load** | Delay before acting, giving SPAs time to render |
 | **Wait for element** | A CSS selector. When set, the script waits for it and **gives up if it never appears** — far more reliable than a fixed delay |
 | **Wait until tab is focused** | Background tabs won't trigger until you switch to them |
@@ -265,9 +303,9 @@ So the current design is:
 No browser is available in the sandbox, so the project ships three Node smoke-test suites that build fake `chrome.*` APIs and DOM shims, then **actually execute** the code.
 
 ```bash
-node tools/mock-harness.mjs      # Service worker: recording/scheduling/replay/CDP/drag/offscreen/triggers/failure paths (67)
+node tools/mock-harness.mjs      # Service worker: recording/scheduling/replay/CDP/drag/offscreen/triggers/menus/shortcuts/import (91)
 node tools/content-harness.mjs   # Content scripts: loading, HUD drawing & echo, drag record/replay, domain rules, trigger behaviour (138)
-node tools/popup-harness.mjs     # Popup: loading, event binding, error visibility, version self-check, trigger UI (31)
+node tools/popup-harness.mjs     # Popup: loading, event binding, error visibility, version self-check, rename, step editing, backup (64)
 ```
 
 These catch what `node --check` cannot: undefined references, misspelled fields, state machines that fall through, and errors swallowed silently.
@@ -282,6 +320,8 @@ Real defects found and fixed this way:
 - Synthesized modifier pills in the HUD had no keyup and accumulated forever at the bottom of the page
 - Synthetic events used top-level viewport coordinates instead of frame-local ones, shifting `clientX` inside iframes
 - The HUD kept redrawing at 60 fps after the pointer stopped, draining battery on long recordings
+
+New regression coverage added in v0.5.0: the schedule domain guard, disabled scripts not arming alarms or answering triggers, legacy scripts having their structure completed on read, import deduplication and bad-data tolerance, the context menu and keyboard shortcuts, rename commits, and step reorder/duplicate/delete/delay editing.
 
 Domain matching exists twice — a reusable module (`lib/domains.js`) and an inlined copy (`content/trigger.js`, since content scripts can't `import`). `tools/content-harness.mjs` **cross-checks both against 23 shared cases** so they can't drift apart.
 
@@ -316,12 +356,14 @@ build-extension.py         Icon generation, validation, packaging
   "id": "s_lx8f3a",
   "name": "Orders · 10-09 14:52",
   "targetUrl": "https://example.com/orders",
+  "enabled": true,                   // master switch: false stops timers and triggers, manual still runs
   "engine": null,                    // null = inherit the global setting
   "schedule": {
     "enabled": true,
     "mode": "interval",              // interval | daily
     "everySec": 1800,                // < 60 goes to offscreen, >= 60 to alarms
-    "time": "09:30"                  // used by daily mode
+    "time": "09:30",                 // used by daily mode
+    "domains": ["example.com"]       // allowed domains for timed runs; empty = unrestricted
   },
   "trigger": {
     "enabled": true,

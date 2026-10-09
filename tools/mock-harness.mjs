@@ -46,7 +46,15 @@ const L = {
   startup: [],
   debuggerDetach: [],
   tabsUpdated: [],
+  menuClicked: [],
+  command: [],
 };
+
+/** chrome.contextMenus.create 建出来的菜单项 */
+const menuItems = [];
+
+/** 模拟里的「当前标签页」URL，测试可以临时改掉 */
+let activeTabUrl = 'https://example.com/app';
 const alarms = new Map();
 const localBag = {};
 const sessionBag = {};
@@ -122,10 +130,10 @@ function installChromeMock() {
 
     tabs: {
       async query() {
-        return [{ id: 1, url: 'https://example.com/app', title: '示例后台', windowId: 1 }];
+        return [{ id: 1, url: activeTabUrl, title: '示例后台', windowId: 1 }];
       },
       async get(id) {
-        return { id, url: 'https://example.com/app', status: 'complete', windowId: 1 };
+        return { id, url: activeTabUrl, status: 'complete', windowId: 1 };
       },
       async update() { return {}; },
       async create() { return { id: 2 }; },
@@ -204,6 +212,16 @@ function installChromeMock() {
       async detach() { calls.debugger.detach += 1; },
       async sendCommand(t, m, p) { calls.debuggerCommands.push({ method: m, params: p }); return {}; },
       onDetach: { addListener: (f) => L.debuggerDetach.push(f) },
+    },
+
+    contextMenus: {
+      onClicked: { addListener: (f) => L.menuClicked.push(f) },
+      async removeAll() { menuItems.length = 0; },
+      create(item) { menuItems.push(item); },
+    },
+
+    commands: {
+      onCommand: { addListener: (f) => L.command.push(f) },
     },
 
     action: {
@@ -652,7 +670,192 @@ async function main() {
   check('SCRIPT_LIST 带回触发记录（界面显示「上次触发」）',
     !!lst?.triggerLog?.[trg.id]?.at, JSON.stringify(lst?.triggerLog));
 
+  /* ---------------------------------------------------------------- *
+   * [15] 右键菜单与快捷键
+   * ---------------------------------------------------------------- */
+
+  console.log('\n\x1b[1m[15] 右键菜单与键盘快捷键\x1b[0m');
+  check('菜单注册了「录制 / 停止」项', menuItems.some((i) => i.id === 'gx:record'),
+    JSON.stringify(menuItems.map((i) => i.id)));
+  check('菜单有「运行脚本」父项', menuItems.some((i) => i.id === 'gx:run'));
+  check('脚本被挂成子项', menuItems.some((i) => i.parentId === 'gx:run' && String(i.id).startsWith('gx:run:')),
+    JSON.stringify(menuItems.filter((i) => i.parentId).map((i) => i.id)));
+  check('注册了 commands 监听', L.command.length === 1, `实际 ${L.command.length}`);
+
+  // 快捷键：切换录制
+  injectedFrames.clear();
+  frameHandlers.clear();
+  await L.command[0]('toggle-record');
+  await sleep(300);
+  check('Ctrl+Shift+E：开始录制', !!sessionBag.gx_recording, JSON.stringify(sessionBag.gx_recording));
+
+  await L.command[0]('toggle-record');
+  await sleep(1300);
+  check('再按一次停止录制', !sessionBag.gx_recording);
+
+  // 快捷键：运行当前页匹配的脚本
+  const cur = await makeScript({
+    steps: fastSteps(),
+    targetUrl: 'https://example.com/app',
+    trigger: { enabled: true, domains: ['example.com'] },
+  });
+  await sleep(200);
+  await L.command[0]('run-current');
+  await sleep(900);
+  const cmdRun = await sendToBackground({ type: 'RUN_STATE' });
+  check('Ctrl+Shift+K：运行当前页匹配的脚本',
+    ['running', 'success'].includes(cmdRun?.run?.status) && cmdRun?.run?.scriptId === cur.id,
+    JSON.stringify(cmdRun?.run)?.slice(0, 140));
+
+
+  /* ---------------------------------------------------------------- *
+   * [16] 定时触发的生效域名守卫
+   * ---------------------------------------------------------------- */
+
+  console.log('\n\x1b[1m[16] 定时触发的生效域名守卫\x1b[0m');
+  frameHandlers.delete(0);
+  const guarded = await makeScript({
+    steps: fastSteps(),
+    schedule: {
+      enabled: true, mode: 'interval', everySec: 1800, time: '09:30',
+      domains: ['other.com'],
+    },
+  });
+  await sleep(150);
+  check('定时域名不影响 alarm 的创建', alarms.has(`gx:script:${guarded.id}`), `现有: ${[...alarms.keys()]}`);
+
+  await L.alarm[0]({ name: `gx:script:${guarded.id}` });
+  await sleep(900);
+  const gRun = await sendToBackground({ type: 'RUN_STATE' });
+  check('跑到范围外的页面会被判失败', gRun?.run?.status === 'failed', JSON.stringify(gRun?.run)?.slice(0, 140));
+  check('失败原因点明了生效域名',
+    /生效域名/.test(sessionBag.gx_last_failure?.error || ''), sessionBag.gx_last_failure?.error);
+
+  // 命中域名时正常执行
+  const okDom = await makeScript({
+    steps: fastSteps(),
+    schedule: {
+      enabled: true, mode: 'interval', everySec: 1800, time: '09:30',
+      domains: ['example.com'],
+    },
+  });
+  await sleep(150);
+  await L.alarm[0]({ name: `gx:script:${okDom.id}` });
+  await sleep(900);
+  const okRun = await sendToBackground({ type: 'RUN_STATE' });
+  check('命中生效域名时正常执行', okRun?.run?.status === 'success', JSON.stringify(okRun?.run)?.slice(0, 140));
+
+  /* ---------------------------------------------------------------- *
+   * [17] 脚本总开关
+   * ---------------------------------------------------------------- */
+
+  console.log('\n\x1b[1m[17] 脚本总开关（停用）\x1b[0m');
+  const offS = await makeScript({
+    steps: fastSteps(),
+    enabled: false,
+    schedule: { enabled: true, mode: 'interval', everySec: 1800, time: '09:30' },
+    trigger: { enabled: true, domains: [] },
+  });
+  await sleep(150);
+  check('停用的脚本不建定时 alarm', !alarms.has(`gx:script:${offS.id}`), `现有: ${[...alarms.keys()]}`);
+
+  const offTrig = await sendToBackground({ type: 'TRIGGER_FIRE', scriptId: offS.id, loadId: 'OFF1' });
+  check('停用的脚本不响应页面触发',
+    offTrig?.ok === false && /停用/.test(offTrig.skipped || ''), JSON.stringify(offTrig));
+
+  const offMenu = menuItems.some((i) => i.id === `gx:run:${offS.id}`);
+  check('停用的脚本不出现在右键菜单里', !offMenu);
+
+  /* ---------------------------------------------------------------- *
+   * [18] 老脚本（缺字段）读出来要补全
+   * ---------------------------------------------------------------- */
+
+  console.log('\n\x1b[1m[18] 老脚本兼容：读出来自动补全结构\x1b[0m');
+  localBag.gx_scripts = [
+    ...(localBag.gx_scripts || []),
+    {
+      id: 's_legacy',
+      name: '老脚本',
+      targetUrl: 'https://example.com/x',
+      steps: [{ type: 'click', locator: { kind: 'css', value: '#a' }, rel: { x: 0.5, y: 0.5 }, delay: 0 }],
+      createdAt: 1,
+      // 注意：没有 enabled / trigger / schedule.domains
+    },
+  ];
+  const l2 = await sendToBackground({ type: 'SCRIPT_LIST' });
+  const legacy = l2.scripts.find((x) => x.id === 's_legacy');
+  check('补齐 enabled', legacy?.enabled === true, JSON.stringify(legacy?.enabled));
+  check('补齐 schedule.domains', Array.isArray(legacy?.schedule?.domains), JSON.stringify(legacy?.schedule));
+  check('补齐 trigger', !!legacy?.trigger && legacy.trigger.enabled === false, JSON.stringify(legacy?.trigger));
+
+  /* ---------------------------------------------------------------- *
+   * [19] 导入
+   * ---------------------------------------------------------------- */
+
+  console.log('\n\x1b[1m[19] 导入脚本\x1b[0m');
+  const imp = await sendToBackground({
+    type: 'SCRIPT_IMPORT',
+    scripts: [
+      { id: 's_imp1', name: '导入的 A', targetUrl: 'https://a.com', steps: [{ type: 'click', locator: { kind: 'css', value: '#x' }, delay: 0 }] },
+      { id: trg.id, name: '重复 id', steps: [{ type: 'click', locator: { kind: 'css', value: '#y' }, delay: 0 }] },
+      { name: '没有步骤', steps: [] },
+      null,
+    ],
+  });
+  check('导入统计正确（1 成功 3 跳过）', imp?.added === 1 && imp?.skipped === 3, JSON.stringify(imp));
+
+  const l3 = await sendToBackground({ type: 'SCRIPT_LIST' });
+  const imported = l3.scripts.find((x) => x.id === 's_imp1');
+  check('导入的脚本被规范化', imported?.enabled === true && Array.isArray(imported?.schedule?.domains),
+    JSON.stringify({ enabled: imported?.enabled, domains: imported?.schedule?.domains }));
+  check('同 id 的现有脚本没有被覆盖',
+    l3.scripts.filter((x) => x.id === trg.id).length === 1,
+    `实际 ${l3.scripts.filter((x) => x.id === trg.id).length} 条`);
+
+  const impEmpty = await sendToBackground({ type: 'SCRIPT_IMPORT', scripts: [] });
+  check('空导入被拒绝', impEmpty?.ok === false, JSON.stringify(impEmpty));
+
+  /* ---------------------------------------------------------------- *
+   * [20] 快捷键「运行当前页」的两条兜底分支
+   * ---------------------------------------------------------------- */
+
+  console.log('\n\x1b[1m[20] 快捷键推送：没有可跑的脚本时不能瞎跑\x1b[0m');
+  injectedFrames.clear();
+  frameHandlers.clear();
+
+  // 一个脚本都没有
+  localBag.gx_scripts = [];
+  check('一个脚本都没有时给出明确原因', await probeRunCurrent(/没有启用的脚本/));
+
+  // 有脚本，但当前页面跟它没关系
+  await makeScript({
+    steps: fastSteps(),
+    targetUrl: 'https://only-this.test/x',
+    trigger: { enabled: true, domains: ['only-this.test'] },
+  });
+  activeTabUrl = 'https://example.com/app';
+  check('当前页面没有匹配的脚本时给出明确原因', await probeRunCurrent(/没有匹配/));
+
+  // 换到对得上的页面就应该跑起来
+  activeTabUrl = 'https://only-this.test/x';
+  const beforeN = calls.notifications.length;
+  L.command[0]('run-current');
+  await sleep(900);
+  const lastRun = await sendToBackground({ type: 'RUN_STATE' });
+  check('页面匹配上就应该正常执行',
+    ['running', 'success'].includes(lastRun?.run?.status) && calls.notifications.length === beforeN,
+    JSON.stringify(lastRun?.run)?.slice(0, 140));
+
   report();
+}
+
+/** 触发「运行当前页」快捷键，检查失败通知里的说法 */
+async function probeRunCurrent(pattern) {
+  const before = calls.notifications.length;
+  L.command[0]('run-current');
+  await sleep(500);
+  const last = calls.notifications[calls.notifications.length - 1];
+  return calls.notifications.length > before && pattern.test(last?.message || '');
 }
 
 function report() {

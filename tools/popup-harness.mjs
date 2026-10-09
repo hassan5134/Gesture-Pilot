@@ -82,6 +82,7 @@ function installGlobals({ respond } = {}) {
       return [];
     },
     createElement: () => el('__created'),
+    body: el('__body'),
   };
 
   globalThis.window = globalThis;
@@ -93,6 +94,13 @@ function installGlobals({ respond } = {}) {
     configurable: true,
     writable: true,
   });
+
+  // 导出用 blob 下载，Node 里可能缺 createObjectURL
+  globalThis.Blob ??= class Blob {
+    constructor(parts) { this.parts = parts; }
+  };
+  globalThis.URL.createObjectURL ??= () => 'blob:mock';
+  globalThis.URL.revokeObjectURL ??= () => {};
 
   globalThis.chrome = {
     tabs: {
@@ -120,6 +128,27 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /* ------------------------------------------------------------------ *
  * 主流程
  * ------------------------------------------------------------------ */
+
+/**
+ * 造一个可控的事件对象。
+ * closest 用「选择器 → 返回值」的映射，测试里想命中哪个就写哪个。
+ */
+function fakeEvent({ closest = {}, matches = [], dataset = {}, value = '', checked = false, type = 'text' } = {}) {
+  return {
+    target: {
+      value,
+      checked,
+      type,
+      dataset,
+      closest: (sel) => closest[sel] ?? null,
+      matches: (sel) => matches.includes(sel),
+    },
+    stopPropagation() {},
+    preventDefault() {},
+  };
+}
+
+const CARD = { '.card': { dataset: { id: 's1' } } };
 
 async function loadPopup() {
   await rm(TMP, { recursive: true, force: true });
@@ -333,19 +362,12 @@ async function main() {
   check('折叠时不渲染触发配置区', !collapsed.includes('生效域名'));
 
   // 展开卡片
-  const fakeEvent = {
-    target: {
-      closest(sel) {
-        if (sel === '.card') return { dataset: { id: 's1' } };
-        if (sel === '[data-act]') return { dataset: { act: 'toggle' } };
-        return null;
-      },
-    },
-    stopPropagation() {},
-  };
+  const toggleEvent = fakeEvent({
+    closest: { '.card': { dataset: { id: 's1' } }, '[data-act]': { dataset: { act: 'toggle' } } },
+  });
   let toggleErr = null;
   try {
-    await boundListeners.get('#list').click(fakeEvent);
+    await boundListeners.get('#list').click(toggleEvent);
     await sleep(120);
   } catch (e) {
     toggleErr = e;
@@ -360,7 +382,222 @@ async function main() {
   check('当前页面匹配时给出绿色徽标', expanded.includes('当前页面匹配'), expanded.slice(0, 300));
   check('显示了上次触发时间', expanded.includes('上次触发'), expanded.slice(-300));
 
+  /* ---------------- 改名 / 步骤编辑 / 备份恢复 ---------------- */
+
+  console.log('\n\x1b[1m[9] 改名、步骤编辑、备份恢复\x1b[0m');
+
+  const TWO_STEPS = [
+    { type: 'click', locator: { kind: 'css', value: '#first' }, rel: { x: 0.5, y: 0.5 }, delay: 0 },
+    { type: 'input', locator: { kind: 'css', value: '#second' }, value: 'abc', delay: 120 },
+  ];
+  let scripts = [{ ...makeScriptFixture(TWO_STEPS) }];
+
+  installGlobals({
+    respond: (msg) => {
+      if (msg.type === 'SCRIPT_LIST') {
+        return {
+          ok: true, version: MOCK_VERSION, scripts: JSON.parse(JSON.stringify(scripts)),
+          settings: {}, run: null, triggerLog: {},
+        };
+      }
+      if (msg.type === 'RECORD_STATE') return { ok: true, recording: null };
+      if (msg.type === 'SCRIPT_UPDATE') {
+        // 后台会规范化，这里简单回显
+        const saved = { ...msg.script, schedule: { domains: [], ...(msg.script.schedule || {}) }, trigger: { domains: [], ...(msg.script.trigger || {}) } };
+        scripts = scripts.map((x) => (x.id === saved.id ? saved : x));
+        return { ok: true, script: saved };
+      }
+      if (msg.type === 'SCRIPT_IMPORT') return { ok: true, added: 1, skipped: 0 };
+      return { ok: true };
+    },
+  });
+  boundListeners.clear();
+  nodes.clear();
+  await loadPopup();
+  await sleep(300);
+
+  const collapsed2 = nodes.get('#list')?.__state?.innerHTML || '';
+  check('展开按钮文案是「配置」', collapsed2.includes('>配置</button>'), collapsed2.slice(0, 300));
+  check('不再出现「详情」', !collapsed2.includes('>详情<'));
+  check('卡片头有启用开关', collapsed2.includes('data-act="enabled"'));
+
+  const listClick = boundListeners.get('#list').click;
+  const listChange = boundListeners.get('#list').change;
+  const listFocusOut = boundListeners.get('#list').focusout;
+  check('注册了 focusout（改名收尾用）', typeof listFocusOut === 'function');
+
+  // ---- 改名：点标题 → 出输入框 → 失焦提交 ----
+  await listClick(fakeEvent({ closest: { ...CARD, '[data-act]': { dataset: { act: 'rename' } } } }));
+  await sleep(80);
+  let html = nodes.get('#list').__state.innerHTML;
+  check('点标题后切换成改名输入框', html.includes('class="rename"'), html.slice(0, 300));
+
+  sendMessageCalls.length = 0;
+  await listFocusOut(fakeEvent({
+    matches: ['input.rename'],
+    closest: CARD,
+    value: '订单核对流程',
+  }));
+  await sleep(120);
+  const renameUpd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
+  check('失焦后改名提交到后台', renameUpd?.script?.name === '订单核对流程',
+    JSON.stringify(renameUpd?.script?.name));
+
+  html = nodes.get('#list').__state?.innerHTML || '';
+  check('提交后退出改名态', !html.includes('class="rename"'));
+
+  // ---- 改名：值没变就不发请求 ----
+  await listClick(fakeEvent({ closest: { ...CARD, '[data-act]': { dataset: { act: 'rename' } } } }));
+  await sleep(60);
+  sendMessageCalls.length = 0;
+  await listFocusOut(fakeEvent({ matches: ['input.rename'], closest: CARD, value: '订单核对流程' }));
+  await sleep(120);
+  check('值没变则不提交', sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').length === 0);
+
+  // ---- 步骤编辑控件 ----
+  await listClick(fakeEvent({ closest: { ...CARD, '[data-act]': { dataset: { act: 'toggle' } } } }));
+  await sleep(80);
+  const body2 = nodes.get('#list')?.__state?.innerHTML || '';
+  check('步骤行有延时输入框', body2.includes('data-delay="0"') && body2.includes('data-delay="1"'), body2.slice(0, 200));
+  check('步骤行有上移/下移/复制/删除',
+    body2.includes('data-up=') && body2.includes('data-down=') && body2.includes('data-dup=') && body2.includes('data-del='));
+  check('首步上移按钮被禁用', /data-up="0"[^>]*disabled/.test(body2), body2.match(/data-up="0"[^>]*/)?.[0]);
+  check('末步下移按钮被禁用', /data-down="1"[^>]*disabled/.test(body2), body2.match(/data-down="1"[^>]*/)?.[0]);
+  check('定时配置里有生效域名', body2.includes('data-sched="domains"'));
+  check('有「插入等待」按钮', body2.includes('data-act="add-wait"'));
+  check('有「导出此脚本」按钮', body2.includes('data-act="export"'));
+
+  // ---- 步骤下移 ----
+  sendMessageCalls.length = 0;
+  await listClick(fakeEvent({ closest: { ...CARD, '[data-down]': { dataset: { down: '0' } } } }));
+  await sleep(120);
+  let upd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
+  check('下移步骤后顺序变了',
+    upd?.script?.steps?.[0]?.locator?.value === '#second',
+    JSON.stringify(upd?.script?.steps?.map((x) => x.locator?.value)));
+
+  // ---- 步骤复制 ----
+  sendMessageCalls.length = 0;
+  await listClick(fakeEvent({ closest: { ...CARD, '[data-dup]': { dataset: { dup: '0' } } } }));
+  await sleep(120);
+  upd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
+  check('复制步骤后多了一步', upd?.script?.steps?.length === 3,
+    `实际 ${upd?.script?.steps?.length}`);
+
+  // ---- 步骤删除 ----
+  sendMessageCalls.length = 0;
+  await listClick(fakeEvent({ closest: { ...CARD, '[data-del]': { dataset: { del: '0' } } } }));
+  await sleep(120);
+  upd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
+  check('删除步骤后少了一步', upd?.script?.steps?.length === 2,
+    `实际 ${upd?.script?.steps?.length}`);
+
+  // ---- 插入等待 ----
+  sendMessageCalls.length = 0;
+  await listClick(fakeEvent({ closest: { ...CARD, '[data-act]': { dataset: { act: 'add-wait' } } } }));
+  await sleep(120);
+  upd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
+  const added = upd?.script?.steps?.at(-1);
+  check('插入等待步骤', added?.type === 'wait' && typeof added.value === 'number',
+    JSON.stringify(added));
+
+  // ---- 步骤延时编辑 ----
+  sendMessageCalls.length = 0;
+  await listChange(fakeEvent({ matches: ['[data-delay]'], closest: CARD, dataset: { delay: '0' }, value: '2500' }));
+  await sleep(120);
+  upd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
+  check('步骤延时被写入', upd?.script?.steps?.[0]?.delay === 2500,
+    JSON.stringify(upd?.script?.steps?.[0]?.delay));
+
+  // ---- 脚本启停 ----
+  sendMessageCalls.length = 0;
+  await listChange(fakeEvent({ matches: ['[data-act="enabled"]'], closest: CARD, checked: false }));
+  await sleep(120);
+  upd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
+  check('总开关写入 enabled=false', upd?.script?.enabled === false, JSON.stringify(upd?.script?.enabled));
+
+  const dimmed = nodes.get('#list')?.__state?.innerHTML || '';
+  check('停用后卡片标记为 off', dimmed.includes('card off'), dimmed.slice(0, 120));
+  check('停用后副标题显示「已停用」', dimmed.includes('已停用'));
+
+  // ---- 定时生效域名 ----
+  sendMessageCalls.length = 0;
+  await listChange(fakeEvent({
+    matches: [], closest: CARD,
+    dataset: { sched: 'domains' }, value: 'example.com, *.foo.com',
+  }));
+  await sleep(150);
+  upd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
+  check('定时生效域名被解析成数组',
+    JSON.stringify(upd?.script?.schedule?.domains) === JSON.stringify(['example.com', '*.foo.com']),
+    JSON.stringify(upd?.script?.schedule?.domains));
+
+  // ---- 设置页备份 / 恢复 ----
+  check('注册了「导出全部」按钮', typeof boundListeners.get('#btnExportAll')?.click === 'function');
+  check('注册了「导入」按钮', typeof boundListeners.get('#btnImport')?.click === 'function');
+  check('注册了「从剪贴板粘贴」按钮', typeof boundListeners.get('#btnPaste')?.click === 'function');
+
+  sendMessageCalls.length = 0;
+  let exportErr = null;
+  try {
+    await boundListeners.get('#btnExportAll').click();
+  } catch (e) {
+    exportErr = e;
+  }
+  check('导出全部不抛异常', !exportErr, exportErr?.stack || String(exportErr));
+
+  // 导入：正常 JSON
+  el('#importText').__state.value = JSON.stringify({
+    format: 'gesture-pilot-scripts',
+    scripts: [{ id: 'x1', name: '导入的', steps: [{ type: 'click', locator: {}, delay: 0 }] }],
+  });
+  sendMessageCalls.length = 0;
+  await boundListeners.get('#btnImport').click();
+  await sleep(200);
+  const impMsg = sendMessageCalls.find((m) => m.type === 'SCRIPT_IMPORT');
+  check('导入把脚本发给了后台', impMsg?.scripts?.length === 1, JSON.stringify(impMsg));
+  check('导入结果反馈给用户', /导入 1 个/.test(el('#importMsg')?.__state?.textContent || ''),
+    el('#importMsg')?.__state?.textContent);
+
+  // 导入：坏 JSON 要给出可读的报错，而不是崩掉
+  el('#importText').__state.value = '{ 这不是 json';
+  sendMessageCalls.length = 0;
+  let impErr = null;
+  try {
+    await boundListeners.get('#btnImport').click();
+    await sleep(120);
+  } catch (e) {
+    impErr = e;
+  }
+  check('坏 JSON 不抛异常', !impErr, impErr?.stack || String(impErr));
+  check('坏 JSON 给出解析失败提示',
+    /JSON 解析失败/.test(el('#importMsg')?.__state?.textContent || ''),
+    el('#importMsg')?.__state?.textContent);
+
+  // 导入：空输入
+  el('#importText').__state.value = '';
+  await boundListeners.get('#btnImport').click();
+  await sleep(80);
+  check('空输入给出提示', /请先把导出的 JSON/.test(el('#importMsg')?.__state?.textContent || ''),
+    el('#importMsg')?.__state?.textContent);
+
   report();
+}
+
+function makeScriptFixture(steps) {
+  return {
+    id: 's1',
+    name: '测试脚本',
+    targetUrl: 'https://example.com/app',
+    steps,
+    engine: null,
+    enabled: true,
+    schedule: { enabled: false, mode: 'interval', everySec: 1800, time: '09:30', domains: [] },
+    trigger: {
+      enabled: false, domains: [], delaySec: 3,
+      readySelector: '', requireVisible: false, once: true, cooldownSec: 120,
+    },
+  };
 }
 
 function report() {

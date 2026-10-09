@@ -37,9 +37,15 @@ export async function saveSettings(patch) {
 
 /* ---------------- 脚本 ---------------- */
 
+/**
+ * 读取时就补齐结构。
+ * 老脚本的存储里没有 trigger / schedule.domains / enabled 这些字段，
+ * 在这里统一补全，界面和后台就都不用到处写兼容判断。
+ */
 export async function listScripts() {
   const got = await chrome.storage.local.get(K_SCRIPTS);
-  return Array.isArray(got[K_SCRIPTS]) ? got[K_SCRIPTS] : [];
+  const list = Array.isArray(got[K_SCRIPTS]) ? got[K_SCRIPTS] : [];
+  return list.map((s) => normalizeScript(s));
 }
 
 export async function getScript(id) {
@@ -98,7 +104,7 @@ export function normalizeTrigger(input) {
   return {
     ...base,
     ...t,
-    domains: Array.isArray(t.domains) ? t.domains.map(String) : parseDomainText(t.domains),
+    domains: parseDomainText(t.domains),
     delaySec: Math.max(0, Number(t.delaySec) || 0),
     readyTimeoutSec: Math.max(1, Number(t.readyTimeoutSec) || base.readyTimeoutSec),
     cooldownSec: Math.max(0, Number(t.cooldownSec) || 0),
@@ -106,6 +112,47 @@ export function normalizeTrigger(input) {
     requireVisible: !!t.requireVisible,
     readySelector: String(t.readySelector || ''),
   };
+}
+
+/* ---------------- 定时 ---------------- */
+
+export function defaultSchedule() {
+  return {
+    enabled: false,
+    mode: 'interval',   // interval | daily
+    everySec: 1800,
+    time: '09:30',
+    domains: [],        // 生效域名：留空 = 不限制
+  };
+}
+
+export function normalizeSchedule(input) {
+  const base = defaultSchedule();
+  const s = input && typeof input === 'object' ? input : {};
+  const time = String(s.time || '');
+  return {
+    ...base,
+    ...s,
+    enabled: !!s.enabled,
+    mode: s.mode === 'daily' ? 'daily' : 'interval',
+    everySec: Math.max(1, Math.round(Number(s.everySec) || 0) || base.everySec),
+    time: /^\d{1,2}:\d{2}$/.test(time) ? time : base.time,
+    domains: parseDomainText(s.domains),
+  };
+}
+
+/* ---------------- 脚本整体规范化 ---------------- */
+
+/**
+ * 所有写入路径都过这里，保证老脚本（没有 trigger / 没有 domains 字段）
+ * 读出来也是完整结构，界面不用到处做兼容判断。
+ */
+export function normalizeScript(input) {
+  const s = { ...(input || {}) };
+  s.enabled = s.enabled !== false; // 默认启用
+  s.schedule = normalizeSchedule(s.schedule);
+  s.trigger = normalizeTrigger(s.trigger);
+  return s;
 }
 
 /** 界面里是一个逗号分隔的文本框，这里转成数组 */

@@ -325,16 +325,6 @@ body {
   background: var(--bg);
 }
 
-.step {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 7px;
-  border-bottom: 1px solid var(--line);
-  font-size: 11.5px;
-}
-
-.step:last-child { border-bottom: 0; }
 .step .idx { color: var(--ink-3); width: 20px; flex: none; font-variant-numeric: tabular-nums; }
 
 .step .kind {
@@ -350,44 +340,9 @@ body {
 .step .kind.click { background: var(--blue-bg); color: var(--blue); }
 .step .kind.input, .step .kind.select { background: var(--green-bg); color: var(--green); }
 .step .kind.key { background: var(--amber-bg); color: var(--amber); }
+.step .kind.drag { background: #fdf0e6; color: #a2521a; }
+.step .kind.wait { background: var(--bg-3); color: var(--ink-3); }
 
-.step .sel {
-  flex: 1;
-  min-width: 0;
-  color: var(--ink-2);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-  font-size: 10.5px;
-}
-
-.step .val {
-  flex: none;
-  width: 104px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  padding: 2px 5px;
-  font: inherit;
-  font-size: 11px;
-  background: var(--bg);
-  color: var(--ink);
-}
-
-.step .val:focus { outline: none; border-color: var(--blue); }
-
-.step .del {
-  flex: none;
-  border: 0;
-  background: none;
-  color: var(--ink-3);
-  cursor: pointer;
-  font-size: 13px;
-  line-height: 1;
-  padding: 2px 4px;
-}
-
-.step .del:hover { color: var(--red); }
 
 /* ---------- settings ---------- */
 
@@ -438,6 +393,196 @@ select:focus, input:focus { outline: none; border-color: var(--blue); }
 }
 
 .hint strong { color: var(--ink-2); font-weight: 600; }
+
+.hint code,
+.stale code {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px;
+  background: var(--bg-3);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+hr.sep {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 16px 0 12px;
+}
+
+h3.sect {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+  margin: 0 0 8px;
+}
+
+.dim { color: var(--ink-3); font-size: 11px; }
+
+textarea {
+  width: 100%;
+  font: inherit;
+  font-size: 11px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  padding: 6px 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--ink);
+  resize: vertical;
+  margin-bottom: 8px;
+}
+
+textarea:focus { outline: none; border-color: var(--blue); }
+
+/* ---------- 卡片：停用 / 改名 ---------- */
+
+.card.off { opacity: 0.62; }
+
+.card-hd .en {
+  flex: none;
+  accent-color: var(--blue);
+  cursor: pointer;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+}
+
+.card-hd .name {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.card-hd .name .txt {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card-hd .name .pen {
+  flex: none;
+  opacity: 0;
+  font-size: 10px;
+  color: var(--ink-3);
+  transition: opacity 0.12s;
+}
+
+.card-hd:hover .name .pen { opacity: 1; }
+
+.card-hd input.rename {
+  width: 100%;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 2px 5px;
+  border: 1px solid var(--blue);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.card-hd input.rename:focus { outline: none; }
+
+/* ---------- 步骤行（两行布局，420px 里塞得下） ---------- */
+
+.step {
+  display: block;
+  padding: 6px 7px;
+  border-bottom: 1px solid var(--line);
+}
+
+.step:last-child { border-bottom: 0; }
+
+.step-l1 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.step-l2 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.step .sel {
+  flex: 1;
+  min-width: 0;
+  color: var(--ink-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+}
+
+.step input.val {
+  flex: 1;
+  min-width: 60px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 5px;
+  font: inherit;
+  font-size: 11px;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.step input.val:focus { outline: none; border-color: var(--blue); }
+
+.step .dly {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10.5px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+.step .dly input {
+  width: 52px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 4px;
+  font: inherit;
+  font-size: 11px;
+  background: var(--bg);
+  color: var(--ink);
+  text-align: right;
+}
+
+.step .dly input:focus { outline: none; border-color: var(--blue); }
+
+.step .ops {
+  flex: none;
+  display: flex;
+  gap: 1px;
+}
+
+.step .ops button {
+  border: 0;
+  background: none;
+  color: var(--ink-3);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 4px;
+  border-radius: 3px;
+}
+
+.step .ops button:hover { color: var(--ink); background: var(--bg-3); }
+.step .ops button[data-del]:hover { color: var(--red); background: var(--red-bg); }
+.step .ops button:disabled { opacity: 0.3; cursor: default; background: none; }
+
+.steps-foot {
+  display: flex;
+  gap: 6px;
+  padding: 7px;
+  border-top: 1px solid var(--line);
+  background: var(--bg-2);
+}
 
 /* ---------- progress ---------- */
 

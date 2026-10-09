@@ -14,8 +14,10 @@ import {
   setRecording, getRecording,
   setFailure, getFailure,
   alarmName, scriptIdFromAlarm, newId,
-  defaultTrigger, normalizeTrigger,
+  defaultTrigger, defaultSchedule, normalizeTrigger, normalizeScript,
 } from './lib/storage.js';
+
+import { matchesDomain } from './lib/domains.js';
 
 import {
   attach as cdpAttach, detach as cdpDetach,
@@ -51,8 +53,115 @@ async function bootstrap() {
   await setRecordIcon(false);
   await syncAlarms();
   await syncOffscreen().catch(() => {});
+  await syncContextMenus().catch(() => {});
   // 看门狗：offscreen 文档意外关闭时重建
   await chrome.alarms.create(WATCHDOG, { periodInMinutes: 1 });
+}
+
+/* ---------------- 右键菜单 ---------------- */
+
+const MENU_RECORD = 'gx:record';
+const MENU_RUN_ROOT = 'gx:run';
+const MENU_RUN_PREFIX = 'gx:run:';
+const MENU_MAX_SCRIPTS = 15;
+
+/** 脚本增删改后要重建菜单 —— chrome.contextMenus 不支持动态更新子项 */
+async function syncContextMenus() {
+  if (!chrome.contextMenus) return;
+  await chrome.contextMenus.removeAll();
+  chrome.contextMenus.create({
+    id: MENU_RECORD,
+    title: 'Gesture Pilot：录制 / 停止本页',
+    contexts: ['page'],
+  });
+
+  const scripts = (await listScripts()).filter((s) => s.enabled !== false);
+  if (!scripts.length) return;
+
+  chrome.contextMenus.create({
+    id: MENU_RUN_ROOT,
+    title: 'Gesture Pilot：运行脚本',
+    contexts: ['page'],
+  });
+  // 菜单项太多会很难用，超出部分引导用户去 popup
+  for (const s of scripts.slice(0, MENU_MAX_SCRIPTS)) {
+    chrome.contextMenus.create({
+      id: `${MENU_RUN_PREFIX}${s.id}`,
+      parentId: MENU_RUN_ROOT,
+      title: trimMenuTitle(s.name),
+      contexts: ['page'],
+    });
+  }
+  if (scripts.length > MENU_MAX_SCRIPTS) {
+    chrome.contextMenus.create({
+      id: `${MENU_RUN_ROOT}:more`,
+      parentId: MENU_RUN_ROOT,
+      title: `…还有 ${scripts.length - MENU_MAX_SCRIPTS} 个，请在扩展面板里运行`,
+      enabled: false,
+      contexts: ['page'],
+    });
+  }
+}
+
+function trimMenuTitle(name) {
+  const s = String(name || '未命名').replace(/\s+/g, ' ').trim();
+  return s.length > 34 ? `${s.slice(0, 34)}…` : s;
+}
+
+chrome.contextMenus?.onClicked.addListener((info, tab) => {
+  const id = String(info.menuItemId || '');
+  (async () => {
+    if (id === MENU_RECORD) {
+      const r = await toggleRecording();
+      if (!r?.ok && r?.error) await notify('手势助手 · 录制', r.error).catch(() => {});
+      return;
+    }
+    if (id.startsWith(MENU_RUN_PREFIX)) {
+      const r = await runScript(id.slice(MENU_RUN_PREFIX.length), { trigger: 'manual' });
+      if (!r?.ok && r?.error) await notify('手势助手 · 运行', r.error).catch(() => {});
+    }
+  })().catch(() => {});
+});
+
+/* ---------------- 键盘快捷键 ---------------- */
+
+chrome.commands?.onCommand.addListener((command) => {
+  (async () => {
+    if (command === 'toggle-record') {
+      const r = await toggleRecording();
+      if (!r?.ok && r?.error) await notify('手势助手 · 录制', r.error).catch(() => {});
+      return;
+    }
+    if (command === 'run-current') {
+      const r = await runFirstMatching();
+      if (!r?.ok) {
+        await notify('手势助手 · 运行', r?.skipped || r?.error || '没有可运行的脚本').catch(() => {});
+      }
+    }
+  })().catch(() => {});
+});
+
+/**
+ * 快捷键「运行当前页面脚本」：优先挑页面加载触发规则命中的那个，
+ * 其次挑 targetUrl 与当前页面同源的。都不匹配就明确报出来，不瞎跑。
+ */
+async function runFirstMatching() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const url = tab?.url || '';
+  const scripts = (await listScripts()).filter((s) => s.enabled !== false);
+  if (!scripts.length) return { ok: false, skipped: '没有启用的脚本' };
+
+  const byTrigger = scripts.find((s) => s.trigger?.enabled && matchesDomain(url, s.trigger.domains));
+  const byScheduleDomain = scripts.find(
+    (s) => s.schedule?.domains?.length && matchesDomain(url, s.schedule.domains),
+  );
+  const byOrigin = scripts.find((s) => s.targetUrl && sameOrigin(s.targetUrl, url));
+  const hit = byTrigger || byScheduleDomain || byOrigin;
+
+  if (!hit) return { ok: false, skipped: '当前页面没有匹配的脚本（可用域名规则或 targetUrl 建立关联）' };
+
+  runScript(hit.id, { trigger: 'manual' });
+  return { ok: true, scriptId: hit.id, name: hit.name };
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -105,77 +214,93 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true;
 });
 
+/* ==================================================================
+ * 录制：开始 / 停止
+ *
+ * 抽成独立函数，因为 popup、右键菜单、键盘快捷键三个入口都要用。
+ * ================================================================== */
+
+async function startRecording() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) throw new Error('找不到活动标签页');
+  if (!/^https?:|^file:/.test(tab.url || '')) {
+    throw new Error('当前页面不支持录制（浏览器内置页 / 扩展页无法注入脚本）');
+  }
+  const rec = await getRecording();
+  if (rec?.tabId) throw new Error('已有录制在进行中，请先停止');
+
+  // 关键：按需注入，兼容「扩展安装前就已打开」的标签页
+  await ensureRecorderInjected(tab.id);
+  await clearCollected();
+
+  const settings = await getSettings();
+  const reached = await broadcast(tab.id, { type: 'GX_RECORD_START', hud: settings.hud !== false });
+  if (!reached) throw new Error('页面脚本已注入但没有响应，请刷新该页面后重试。');
+
+  await setRecording({ tabId: tab.id, url: tab.url, title: tab.title || '', startedAt: Date.now() });
+  await setRecordIcon(true);
+  return { ok: true, tabId: tab.id, url: tab.url, hud: settings.hud !== false };
+}
+
+async function stopRecording() {
+  const rec = await getRecording();
+  if (!rec) throw new Error('当前没有在录制');
+
+  await broadcast(rec.tabId, { type: 'GX_RECORD_STOP' });
+  await sleep(800); // 等各 frame 把最后一批上报完
+
+  const { steps: raw, frameIds } = await readCollected();
+  const steps = mergeFrameSteps(raw);
+
+  await setRecording(null);
+  await clearCollected();
+  await setRecordIcon(false);
+
+  if (!steps.length) {
+    await setFailure({
+      scriptName: '录制',
+      error: frameIds.length
+        ? `录制通道正常（${frameIds.length} 个 frame 有响应），但这段时间内没有捕获到任何操作。` +
+          `请确认操作的是当前标签页；另外纯键盘输入在输入框内会被聚合成「输入」步骤，需要离开输入框才会落库。`
+        : '没有任何 frame 响应录制结束信号，页面可能已经关闭或跳走。请刷新目标页面后重试。',
+      at: Date.now(),
+    });
+    return { ok: true, saved: null };
+  }
+
+  const now = new Date();
+  const stamp = `${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+
+  const script = normalizeScript({
+    id: newId(),
+    name: `${trimTitle(rec.title)} · ${stamp}`,
+    targetUrl: rec.url,
+    steps,
+    createdAt: Date.now(),
+    enabled: true,
+    engine: null, // null = 跟随全局设置
+    schedule: defaultSchedule(),
+  });
+
+  await saveScript(script);
+  await syncContextMenus().catch(() => {});
+  return { ok: true, saved: script };
+}
+
+/** 右键菜单与快捷键共用：在「开始」和「停止」之间切换 */
+async function toggleRecording() {
+  const rec = await getRecording();
+  return rec?.tabId ? stopRecording() : startRecording();
+}
+
 async function route(msg, sender) {
   switch (msg.type) {
     /* ---------- 录制 ---------- */
-    case 'RECORD_START': {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (!tab?.id) throw new Error('找不到活动标签页');
-      if (!/^https?:|^file:/.test(tab.url || '')) {
-        throw new Error('当前页面不支持录制（浏览器内置页 / 扩展页无法注入脚本）');
-      }
-      const rec = await getRecording();
-      if (rec?.tabId) throw new Error('已有录制在进行中，请先停止');
+    case 'RECORD_START':
+      return await startRecording();
 
-      // 关键：按需注入，兼容「扩展安装前就已打开」的标签页
-      await ensureRecorderInjected(tab.id);
-      await clearCollected();
-
-      const settings = await getSettings();
-      const reached = await broadcast(tab.id, { type: 'GX_RECORD_START', hud: settings.hud !== false });
-      if (!reached) throw new Error('页面脚本已注入但没有响应，请刷新该页面后重试。');
-
-      await setRecording({
-        tabId: tab.id,
-        url: tab.url,
-        title: tab.title || '',
-        startedAt: Date.now(),
-      });
-      await setRecordIcon(true);
-      return { ok: true, tabId: tab.id, url: tab.url, hud: settings.hud !== false };
-    }
-
-    case 'RECORD_STOP': {
-      const rec = await getRecording();
-      if (!rec) throw new Error('当前没有在录制');
-
-      await broadcast(rec.tabId, { type: 'GX_RECORD_STOP' });
-      await sleep(800); // 等各 frame 把最后一批上报完
-
-      const { steps: raw, frameIds } = await readCollected();
-      const steps = mergeFrameSteps(raw);
-
-      await setRecording(null);
-      await clearCollected();
-      await setRecordIcon(false);
-
-      if (!steps.length) {
-        await setFailure({
-          scriptName: '录制',
-          error: frameIds.length
-            ? `录制通道正常（${frameIds.length} 个 frame 有响应），但这段时间内没有捕获到任何操作。` +
-              `请确认操作的是当前标签页；另外纯键盘输入在输入框内会被聚合成「输入」步骤，需要离开输入框才会落库。`
-            : '没有任何 frame 响应录制结束信号，页面可能已经关闭或跳走。请刷新目标页面后重试。',
-          at: Date.now(),
-        });
-        return { ok: true, saved: null };
-      }
-
-      const now = new Date();
-      const stamp = `${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-      const script = {
-        id: newId(),
-        name: `${trimTitle(rec.title)} · ${stamp}`,
-        targetUrl: rec.url,
-        steps,
-        createdAt: Date.now(),
-        engine: null, // null = 跟随全局设置
-        schedule: { enabled: false, mode: 'interval', everySec: 1800, time: '09:30' },
-        trigger: defaultTrigger(),
-      };
-      await saveScript(script);
-      return { ok: true, saved: script };
-    }
+    case 'RECORD_STOP':
+      return await stopRecording();
 
     case 'RECORD_STATE': {
       const rec = await getRecording();
@@ -200,23 +325,21 @@ async function route(msg, sender) {
       return { ok: true, script: await getScript(msg.id) };
 
     case 'SCRIPT_UPDATE': {
-      const next = {
-        ...msg.script,
-        updatedAt: Date.now(),
-        trigger: normalizeTrigger(msg.script?.trigger),
-      };
+      const next = normalizeScript({ ...msg.script, updatedAt: Date.now() });
       await saveScript(next);
       // scheduleOne 会重建该脚本的 alarm（重置倒计时 —— 用户刚改了周期，符合预期）；
       // syncAlarms 再统一收尾：清理失效 alarm，并把秒级任务同步给 offscreen。
       // 少了 syncAlarms 这一句，改成秒级周期就不会生效。
       await scheduleOne(next);
       await syncAlarms();
+      await syncContextMenus().catch(() => {});
       return { ok: true, script: next };
     }
 
     case 'SCRIPT_DELETE':
       await deleteScript(msg.id);
       await syncAlarms();
+      await syncContextMenus().catch(() => {});
       return { ok: true };
 
     case 'SCRIPT_DUPLICATE': {
@@ -230,7 +353,44 @@ async function route(msg, sender) {
         schedule: { ...src.schedule, enabled: false },
       };
       await saveScript(copy);
+      await syncContextMenus().catch(() => {});
       return { ok: true, script: copy };
+    }
+
+    case 'SCRIPT_IMPORT': {
+      const incoming = Array.isArray(msg.scripts) ? msg.scripts : [];
+      if (!incoming.length) throw new Error('没有可导入的脚本');
+
+      const existing = await listScripts();
+      const ids = new Set(existing.map((s) => s.id));
+      const added = [];
+      let skipped = 0;
+
+      for (const raw of incoming) {
+        // 结构不完整的直接跳过，不让一条坏数据毁掉整次导入
+        if (!raw || typeof raw !== 'object' || !Array.isArray(raw.steps) || !raw.steps.length) {
+          skipped++;
+          continue;
+        }
+        // id 已存在就跳过 —— 导入是「补充」不是「覆盖」，避免误删现有配置
+        if (raw.id && ids.has(raw.id)) {
+          skipped++;
+          continue;
+        }
+        const s = normalizeScript({
+          ...raw,
+          id: raw.id || newId(),
+          name: String(raw.name || '导入的脚本'),
+          importedAt: Date.now(),
+        });
+        ids.add(s.id);
+        await saveScript(s);
+        added.push(s);
+      }
+
+      await syncAlarms();
+      await syncContextMenus().catch(() => {});
+      return { ok: true, added: added.length, skipped, scripts: added };
     }
 
     /* ---------- 运行 ---------- */
@@ -341,6 +501,8 @@ async function syncAlarms() {
   const wanted = new Set();
 
   for (const s of scripts) {
+    // 总开关关掉的脚本，定时与页面触发都不再生效
+    if (s.enabled === false) continue;
     const sch = s.schedule;
     if (!sch?.enabled) continue;
     // 秒级周期走 offscreen，不建 alarm
@@ -415,6 +577,7 @@ async function syncOffscreen(scriptsIn, settingsIn) {
   const scripts = scriptsIn || (await listScripts());
   const jobs = scripts
     .filter((s) => {
+      if (s.enabled === false) return false;
       const sch = s.schedule;
       return sch?.enabled && sch.mode === 'interval' && Number(sch.everySec) < 60 && Number(sch.everySec) >= 1;
     })
@@ -451,6 +614,7 @@ async function handleTrigger(msg, sender) {
 
   const script = await getScript(scriptId);
   if (!script) return { ok: false, skipped: '脚本已不存在' };
+  if (script.enabled === false) return { ok: false, skipped: '脚本已停用' };
 
   const t = normalizeTrigger(script.trigger);
   if (!t.enabled) return { ok: false, skipped: '触发未启用' };
@@ -521,6 +685,18 @@ async function runScript(id, ctx = {}) {
 
     const tab = await ensureTargetTab(script);
     tabId = tab.id;
+
+    // 生效域名守卫：只约束「定时」这一条自动路径。
+    // 页面加载触发有它自己的 domains（内容脚本侧已经筛过），
+    // 手动运行是明确的用户意图，不受限制。
+    if (ctx.trigger === 'schedule') {
+      const allowed = script.schedule?.domains || [];
+      if (allowed.length && !matchesDomain(tab.url || '', allowed)) {
+        throw new Error(
+          `当前页面 ${hostOf(tab.url)} 不在生效域名范围内，已跳过（生效域名：${allowed.join('、')}）`,
+        );
+      }
+    }
 
     await setRunState({ ...base, status: 'running', index: 0, total, tabId, phase: '准备页面' });
 
@@ -624,6 +800,14 @@ function truncate(s, n = 18) {
 }
 
 /* ---------------- 目标标签页 ---------------- */
+
+function hostOf(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return String(url || '未知页面');
+  }
+}
 
 function sameOrigin(a, b) {
   try {
