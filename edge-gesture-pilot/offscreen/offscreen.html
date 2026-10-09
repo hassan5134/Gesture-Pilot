@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>Gesture Pilot timer</title>
+  </head>
+  <body>
+    <!--
+      不可见的 offscreen 文档，唯一用途是承载秒级定时器。
+      MV3 的 service worker 空闲约 30 秒即被回收，setInterval 无法存活，
+      所以低于 1 分钟的周期必须由这里驱动。
+    -->
+    <script src="offscreen.js"></script>
+  </body>
+</html>

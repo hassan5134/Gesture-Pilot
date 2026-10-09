@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# Extension signing keys — NEVER commit these.
+#
+# `edge://extensions` → Pack extension produces a .crx plus a .pem. That .pem
+# is the private key for the extension's ID: anyone holding it can sign
+# updates that browsers will accept as yours.
+# ---------------------------------------------------------------------------
+*.pem
+*.crx
+*.key
+
+# Build output — regenerate with `python build-extension.py`
+dist/
+
+# Workspace-local tooling state
+.workbuddy/
+
+# ---------------------------------------------------------------------------
+# Generic noise
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node
+node_modules/

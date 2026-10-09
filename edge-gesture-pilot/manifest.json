@@ -1,0 +1,57 @@
+{
+  "manifest_version": 3,
+  "name": "Gesture Pilot · 手势助手",
+  "version": "0.4.0",
+  "description": "录制鼠标与键盘操作，按计划自动重放，用于辅助重复性页面操作。",
+  "minimum_chrome_version": "116",
+
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting",
+    "webNavigation",
+    "alarms",
+    "offscreen",
+    "notifications",
+    "debugger"
+  ],
+  "host_permissions": ["<all_urls>"],
+
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/selector.js", "content/hud.js", "content/recorder.js"],
+      "all_frames": true,
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/trigger.js"],
+      "all_frames": false,
+      "run_at": "document_idle"
+    }
+  ],
+
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Gesture Pilot",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

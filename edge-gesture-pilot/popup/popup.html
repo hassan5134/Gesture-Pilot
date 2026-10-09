@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="head">
+      <div class="brand">
+        <span class="dot"></span>
+        <span class="brand-text">
+          <span class="brand-name">Gesture Pilot <span class="ver" id="ver" title="当前运行的扩展版本">v?</span></span>
+          <small>手势助手</small>
+        </span>
+      </div>
+      <button id="btnRecord" class="btn primary">开始录制</button>
+    </header>
+
+    <!-- 后台与界面版本不一致时提示重新加载 -->
+    <div id="stale" class="stale" hidden></div>
+
+    <div id="banner" class="banner" hidden></div>
+
+    <nav class="tabs">
+      <button class="tab on" data-tab="scripts">脚本 <span id="cnt" class="pill">0</span></button>
+      <button class="tab" data-tab="settings">设置</button>
+    </nav>
+
+    <main>
+      <section class="pane on" id="pane-scripts">
+        <div id="list" class="list"></div>
+        <div id="empty" class="empty" hidden>
+          还没有脚本。<br />
+          点右上角「开始录制」，在页面上正常操作一遍，再回来停止。
+        </div>
+      </section>
+
+      <section class="pane" id="pane-settings">
+        <div class="field">
+          <label for="s-engine">回放引擎</label>
+          <select id="s-engine" data-set="engine">
+            <option value="synthetic">合成事件（轻量，无额外权限提示）</option>
+            <option value="cdp">CDP 真实输入（isTrusted=true，与 DevTools 互斥）</option>
+          </select>
+        </div>
+
+        <div class="grid">
+          <div class="field">
+            <label for="s-stepTimeout">单步超时（毫秒）</label>
+            <input id="s-stepTimeout" type="number" min="500" step="500" data-set="stepTimeout" />
+          </div>
+          <div class="field">
+            <label for="s-retry">失败重试次数</label>
+            <input id="s-retry" type="number" min="0" max="5" data-set="retry" />
+          </div>
+          <div class="field">
+            <label for="s-speed">播放倍速</label>
+            <input id="s-speed" type="number" min="0.25" max="10" step="0.25" data-set="speed" />
+          </div>
+          <div class="field">
+            <label for="s-minGapMs">步骤最小间隔（毫秒）</label>
+            <input id="s-minGapMs" type="number" min="0" step="20" data-set="minGapMs" />
+          </div>
+          <div class="field">
+            <label for="s-maxGapMs">间隔封顶（毫秒）</label>
+            <input id="s-maxGapMs" type="number" min="500" step="500" data-set="maxGapMs" />
+          </div>
+          <div class="field">
+            <label for="s-jitterMs">随机抖动上限（毫秒）</label>
+            <input id="s-jitterMs" type="number" min="0" step="50" data-set="jitterMs" />
+          </div>
+        </div>
+
+        <label class="sw"><input type="checkbox" data-set="hud" /> 录制时在页面上显示实时提示（鼠标轨迹 / 点击 / 按键）</label>
+        <label class="sw"><input type="checkbox" data-set="humanize" /> 鼠标轨迹自然化（曲线 + 抖动）</label>
+        <label class="sw"><input type="checkbox" data-set="notifyOnFail" /> 执行失败时发送桌面通知</label>
+
+        <p class="hint">
+          修改会自动保存。<strong>秒级周期</strong>（&lt; 60 秒）由 offscreen 文档驱动；
+          <strong>分钟级及以上</strong>走 chrome.alarms，Service Worker 被回收也不会丢。
+        </p>
+      </section>
+    </main>
+
+    <script src="popup.js" type="module"></script>
+  </body>
+</html>
