@@ -186,7 +186,7 @@ Besides timers, a script can **run automatically when a matching page loads**. C
 | **Wait N seconds after load** | Delay before acting, giving SPAs time to render |
 | **Wait for element** | A CSS selector. When set, the script waits for it and **gives up if it never appears** — far more reliable than a fixed delay |
 | **Wait until tab is focused** | Background tabs won't trigger until you switch to them |
-| **Cooldown (seconds)** | Minimum gap between two trigger firings |
+| **Cooldown (seconds)** | Guards only against navigation the page causes **itself**. It **does not** apply when you press F5, retype the address or open a bookmark |
 | **Only once per page load** | On by default. Counted per page load, so a refresh counts as a new one |
 
 ### Domain patterns
@@ -207,12 +207,16 @@ While a card is expanded the UI shows **"current page matches / doesn't match"**
 A script may navigate, and navigation re-satisfies the trigger condition — done naively that's an infinite loop. Three gates:
 
 1. **Once per page load** — each content-script instance generates a `loadId`; the background remembers which one already fired
-2. **Cooldown** — a minimum gap between firings
+2. **Cooldown** — applies only to page loads the page itself caused
 3. **Skip while another script is running**, so two automations never fight over the same page
 
-All three live in the service worker on purpose: a content script is a fresh instance on every page load and cannot remember "I just ran", yet these gates specifically need memory that spans page loads.
+**User-initiated navigation is exempt.** The background listens to `chrome.webNavigation.onCommitted` and inspects the load's `transitionType`: `reload` (F5), `typed` (address bar), `auto_bookmark` and `generated` all count as a fresh user intent and bypass the cooldown.
 
-Skip reasons are logged to the page console with a `[Gesture Pilot]` prefix.
+Without that exemption you get the classic *the script ran once and now refreshing never triggers it again* — which is exactly what 0.5.1 fixed. Conversely, navigation the page caused itself (`link`, `form_submit`) is still rate-limited, so a script cannot drive itself in circles.
+
+All three gates live in the service worker on purpose: a content script is a fresh instance on every page load and cannot remember "I just ran", yet these gates specifically need memory that spans page loads.
+
+Skip reasons go to the page console (prefixed with `[Gesture Pilot]`) **and are shown right in the popup's trigger section** — *last skipped: cooling down, 8s to go*. No need to open DevTools and guess.
 
 ---
 
@@ -303,9 +307,9 @@ So the current design is:
 No browser is available in the sandbox, so the project ships three Node smoke-test suites that build fake `chrome.*` APIs and DOM shims, then **actually execute** the code.
 
 ```bash
-node tools/mock-harness.mjs      # Service worker: recording/scheduling/replay/CDP/drag/offscreen/triggers/menus/shortcuts/import (91)
+node tools/mock-harness.mjs      # Service worker: recording/scheduling/replay/CDP/drag/offscreen/triggers/menus/shortcuts/import (103)
 node tools/content-harness.mjs   # Content scripts: loading, HUD drawing & echo, drag record/replay, domain rules, trigger behaviour (138)
-node tools/popup-harness.mjs     # Popup: loading, event binding, error visibility, version self-check, rename, step editing, backup (64)
+node tools/popup-harness.mjs     # Popup: loading, event binding, error visibility, version self-check, rename, step editing, backup (66)
 ```
 
 These catch what `node --check` cannot: undefined references, misspelled fields, state machines that fall through, and errors swallowed silently.
@@ -320,6 +324,8 @@ Real defects found and fixed this way:
 - Synthesized modifier pills in the HUD had no keyup and accumulated forever at the bottom of the page
 - Synthetic events used top-level viewport coordinates instead of frame-local ones, shifting `clientX` inside iframes
 - The HUD kept redrawing at 60 fps after the pointer stopped, draining battery on long recordings
+
+Added in v0.5.1: user-initiated reloads, retyped addresses and bookmarks bypass the cooldown and fire again, script-driven link navigation is still blocked (so a script cannot trigger itself), subframe navigation does not pollute the top-level verdict, and skip reasons are surfaced in the UI.
 
 New regression coverage added in v0.5.0: the schedule domain guard, disabled scripts not arming alarms or answering triggers, legacy scripts having their structure completed on read, import deduplication and bad-data tolerance, the context menu and keyboard shortcuts, rename commits, and step reorder/duplicate/delete/delay editing.
 
@@ -373,7 +379,7 @@ build-extension.py         Icon generation, validation, packaging
     "readyTimeoutSec": 20,
     "requireVisible": false,
     "once": true,
-    "cooldownSec": 120
+    "cooldownSec": 10
   },
   "steps": [
     { "type": "click",  "locator": {}, "rel": { "x": 0.51, "y": 0.48 }, "delay": 0 },

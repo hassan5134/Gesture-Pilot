@@ -318,6 +318,10 @@ function triggerBlock(s) {
         ? '<span class="tag off">当前页面不匹配</span>'
         : '';
 
+  // 跳过记录比触发记录新，说明上一次尝试是被拦下来的 —— 那才是用户想知道的
+  const skipLog = state.triggerLog?.[`skip_${s.id}`];
+  const showSkip = !!skipLog && (!log?.at || skipLog.at > log.at);
+
   const fired = log?.at
     ? `上次触发 ${new Date(log.at).toLocaleTimeString('zh-CN', { hour12: false })}`
     : '尚未触发过';
@@ -340,6 +344,9 @@ function triggerBlock(s) {
     <input type="number" data-trig="cooldownSec" min="0" value="${t.cooldownSec}" style="width:62px" />
     <span>秒</span>
   </div>
+  <div class="row" style="margin:-1px 0 5px">
+    <span style="font-size:10.5px;color:var(--ink-3);line-height:1.5">冷却只防「页面自己跳转引起的连环触发」。<strong>你手动刷新 / 重新输入地址不受它限制</strong>，每次刷新都会重新触发。</span>
+  </div>
 
   <div class="row">
     <span>等元素</span>
@@ -351,6 +358,7 @@ function triggerBlock(s) {
   <label class="sw"><input type="checkbox" data-trig="once" ${t.once ? 'checked' : ''} /> 同一次页面加载只触发一次</label>
 
   <div class="row" style="margin:0">${scopeBadge}<span style="margin-left:auto;color:var(--ink-3)">${esc(fired)}</span></div>
+  ${showSkip ? `<div class="row" style="margin:5px 0 0;color:var(--amber);font-size:10.5px;line-height:1.5">上次被跳过：${esc(skipLog.reason)}</div>` : ''}
 </div>`;
 }
 

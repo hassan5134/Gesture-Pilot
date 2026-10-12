@@ -339,12 +339,15 @@ async function main() {
             schedule: { enabled: false, mode: 'interval', everySec: 1800, time: '09:30' },
             trigger: {
               enabled: true, domains: ['example.com'], delaySec: 5,
-              readySelector: '', requireVisible: false, once: true, cooldownSec: 120,
+              readySelector: '', requireVisible: false, once: true, cooldownSec: 10,
             },
           }],
           settings: {},
           run: null,
-          triggerLog: { s1: { at: Date.now() - 60000 } },
+          triggerLog: {
+            s1: { at: Date.now() - 60000 },
+            'skip_s1': { reason: '冷却中，还要等 8 秒（防页面自己跳转连环触发；手动刷新不受限）', at: Date.now() - 30000 },
+          },
         };
       }
       if (msg.type === 'RECORD_STATE') return { ok: true, recording: null };
@@ -381,6 +384,9 @@ async function main() {
   check('延迟与冷却预填了数值', expanded.includes('data-trig="delaySec"') && expanded.includes('data-trig="cooldownSec"'));
   check('当前页面匹配时给出绿色徽标', expanded.includes('当前页面匹配'), expanded.slice(0, 300));
   check('显示了上次触发时间', expanded.includes('上次触发'), expanded.slice(-300));
+  check('上一次被跳过时，界面上直接说明原因',
+    expanded.includes('上次被跳过') && expanded.includes('冷却中'), expanded.slice(-300));
+  check('说清了「手动刷新不受冷却限制」', expanded.includes('手动刷新'));
 
   /* ---------------- 改名 / 步骤编辑 / 备份恢复 ---------------- */
 
@@ -595,7 +601,7 @@ function makeScriptFixture(steps) {
     schedule: { enabled: false, mode: 'interval', everySec: 1800, time: '09:30', domains: [] },
     trigger: {
       enabled: false, domains: [], delaySec: 3,
-      readySelector: '', requireVisible: false, once: true, cooldownSec: 120,
+      readySelector: '', requireVisible: false, once: true, cooldownSec: 10,
     },
   };
 }

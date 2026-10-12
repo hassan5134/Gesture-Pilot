@@ -94,7 +94,10 @@ export function defaultTrigger() {
     readyTimeoutSec: 20,
     requireVisible: false,
     once: true,
-    cooldownSec: 120,
+    // 冷却只用来防「页面或脚本自己跳转造成的连环触发」。
+    // 用户手动刷新 / 重新输入地址是新的意图，绕过这条判断（见 handleTrigger），
+    // 所以这里可以给一个小值 —— 给大了反而会误伤「跑完想再跑一次」。
+    cooldownSec: 10,
   };
 }
 

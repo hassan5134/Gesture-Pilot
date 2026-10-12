@@ -48,6 +48,7 @@ const L = {
   tabsUpdated: [],
   menuClicked: [],
   command: [],
+  webNavCommitted: [],
 };
 
 /** chrome.contextMenus.create 建出来的菜单项 */
@@ -192,6 +193,7 @@ function installChromeMock() {
     },
 
     webNavigation: {
+      onCommitted: { addListener: (f) => L.webNavCommitted.push(f) },
       async getAllFrames() {
         return [{ frameId: 0, url: 'https://example.com/app' }];
       },
@@ -845,6 +847,104 @@ async function main() {
   check('页面匹配上就应该正常执行',
     ['running', 'success'].includes(lastRun?.run?.status) && calls.notifications.length === beforeN,
     JSON.stringify(lastRun?.run)?.slice(0, 140));
+
+  /* ---------------------------------------------------------------- *
+   * [21] 刷新页面 = 新的一次触发
+   *
+   * 曾经的实现只看冷却，导致「脚本跑过一次之后，怎么刷新都不再触发」。
+   * 现在靠导航来源区分：用户主动导航（刷新 / 重新输入地址 / 书签）
+   * 绕过冷却，页面或脚本自己跳转过来的仍然拦。
+   * ---------------------------------------------------------------- */
+
+  console.log('\n\x1b[1m[21] 刷新页面要能重新触发\x1b[0m');
+  check('注册了导航来源监听', L.webNavCommitted.length === 1, `实际 ${L.webNavCommitted.length}`);
+
+  sessionBag.gx_trigger_log = {};
+  sessionBag.gx_nav = {};
+  localBag.gx_scripts = [];
+  injectedFrames.clear();
+  frameHandlers.clear();
+  activeTabUrl = 'https://reload.test/app';
+
+  const rlScript = await makeScript({
+    steps: fastSteps(),
+    targetUrl: 'https://reload.test/app',
+    trigger: { enabled: true, domains: ['reload.test'], delaySec: 0, once: true, cooldownSec: 10 },
+  });
+  await sleep(200);
+
+  const RL_SENDER = () => ({ tab: { id: 1, url: activeTabUrl }, frameId: 0, url: activeTabUrl });
+  const fireRl = (loadId) =>
+    sendToBackground(
+      { type: 'TRIGGER_FIRE', scriptId: rlScript.id, loadId, url: activeTabUrl },
+      RL_SENDER(),
+    );
+  const navTo = (url, transitionType) => {
+    for (const f of L.webNavCommitted) {
+      f({ tabId: 1, frameId: 0, url, transitionType, transitionQualifiers: [] });
+    }
+  };
+
+  const rr1 = await fireRl('R1');
+  check('首次进入页面就触发', rr1?.ok === true, JSON.stringify(rr1));
+  await sleep(900);
+
+  const rr2 = await fireRl('R1');
+  check('同一次加载内不重复触发（once）',
+    rr2?.ok === false && /已经触发过/.test(rr2.skipped || ''), JSON.stringify(rr2));
+
+  const rr3 = await fireRl('R2');
+  check('没有用户导航证据时，新加载仍受冷却限制',
+    rr3?.ok === false && /冷却中/.test(rr3.skipped || ''), JSON.stringify(rr3));
+
+  // ---- 用户按 F5 ----
+  navTo(activeTabUrl, 'reload');
+  await sleep(150);
+  const rr4 = await fireRl('R3');
+  check('用户按 F5 刷新可以在冷却期内重新触发', rr4?.ok === true, JSON.stringify(rr4));
+  check('结果里标明了这次是刷新来的', rr4?.reload === true, JSON.stringify(rr4));
+  await sleep(900);
+
+  // ---- 再刷一次：必须还能触发，才是「每次都重新跑」 ----
+  navTo(activeTabUrl, 'reload');
+  await sleep(150);
+  const rr5 = await fireRl('R4');
+  check('连续刷新每次都能重新触发', rr5?.ok === true, JSON.stringify(rr5));
+  await sleep(900);
+
+  // ---- 地址栏重新输入 ----
+  navTo(activeTabUrl, 'typed');
+  await sleep(150);
+  const rr6 = await fireRl('R5');
+  check('地址栏重新输入也算新的一次意图', rr6?.ok === true, JSON.stringify(rr6));
+  await sleep(900);
+
+  // ---- 脚本自己点链接跳过来的：必须仍然被拦，否则会无限自己触发自己 ----
+  navTo(activeTabUrl, 'link');
+  await sleep(150);
+  const rr7 = await fireRl('R6');
+  check('脚本点链接跳转过来的仍被冷却拦住（防死循环）',
+    rr7?.ok === false && /冷却中/.test(rr7.skipped || ''), JSON.stringify(rr7));
+
+  // ---- 导航记录来自别的站点：不能拿来当「用户刷新」的证据 ----
+  navTo('https://somewhere-else.test/x', 'reload');
+  await sleep(150);
+  const rr8 = await fireRl('R7');
+  check('导航记录来自别的站点时不放行',
+    rr8?.ok === false && /冷却中/.test(rr8.skipped || ''), JSON.stringify(rr8));
+
+  check('跳过原因被记下来（界面直接显示，不用开控制台）',
+    /冷却中/.test(sessionBag.gx_trigger_log?.[`skip_${rlScript.id}`]?.reason || ''),
+    JSON.stringify(sessionBag.gx_trigger_log?.[`skip_${rlScript.id}`]));
+
+  // ---- 子 frame 的导航不能污染顶层判定 ----
+  for (const f of L.webNavCommitted) {
+    f({ tabId: 1, frameId: 3, url: activeTabUrl, transitionType: 'reload', transitionQualifiers: [] });
+  }
+  await sleep(150);
+  const rr9 = await fireRl('R8');
+  check('子 frame 的刷新不算顶层用户导航（仍受冷却限制）',
+    rr9?.ok === false && /冷却中/.test(rr9.skipped || ''), JSON.stringify(rr9));
 
   report();
 }

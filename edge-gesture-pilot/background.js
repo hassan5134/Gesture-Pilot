@@ -54,6 +54,8 @@ async function bootstrap() {
   await syncAlarms();
   await syncOffscreen().catch(() => {});
   await syncContextMenus().catch(() => {});
+  // 记录导航来源：区分「用户刷新」和「页面自己跳转」，触发冷却据此放行或拦截
+  await chrome.storage.session.remove(K_NAV).catch(() => {});
   // 看门狗：offscreen 文档意外关闭时重建
   await chrome.alarms.create(WATCHDOG, { periodInMinutes: 1 });
 }
@@ -188,6 +190,10 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 /* ==================================================================
  * 消息路由
  * ================================================================== */
+
+chrome.webNavigation.onCommitted.addListener((details) => {
+  recordNav(details);
+});
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg.type !== 'string') return;
@@ -607,44 +613,117 @@ async function syncOffscreen(scriptsIn, settingsIn) {
  * ================================================================== */
 
 const K_TRIGGER_LOG = 'gx_trigger_log';
+const K_NAV = 'gx_nav';
+
+/**
+ * 浏览器认可的「用户主动导航」。
+ *
+ * 用它把「用户刷新 / 重新敲地址 / 点书签」和「页面或脚本自己跳转」区分开：
+ * 前者是用户新的一次意图，不该被防连环触发的冷却拦住；
+ * 后者才需要拦 —— 脚本点个链接跳到同样匹配的页面，会无止境地自己触发自己。
+ */
+const USER_NAV = new Set(['reload', 'typed', 'auto_bookmark', 'generated']);
+
+/** 记录每个标签页顶层 frame 最近一次导航的来源 */
+async function recordNav(details) {
+  if (details.frameId !== 0) return; // 内容脚本只注入顶层，只关心顶层
+  try {
+    const got = await chrome.storage.session.get(K_NAV);
+    const map = got[K_NAV] || {};
+    map[String(details.tabId)] = {
+      url: details.url,
+      transitionType: details.transitionType,
+      qualifiers: details.transitionQualifiers || [],
+      at: Date.now(),
+    };
+    await chrome.storage.session.set({ [K_NAV]: map });
+  } catch {
+    /* 导航已经发生了，这里写失败不能反过来影响它 */
+  }
+}
+
+/**
+ * 判断这次触发所对应的页面加载，是不是用户主动发起的。
+ * 窗口取 15 秒：onCommitted 一定早于内容脚本的 document_idle，
+ * 超时的记录说明这是上一次导航留下的，不能拿来用。
+ */
+async function isUserNavigation(tabId, url) {
+  if (typeof tabId !== 'number') return false;
+  try {
+    const got = await chrome.storage.session.get(K_NAV);
+    const nav = (got[K_NAV] || {})[String(tabId)];
+    if (!nav) return false;
+    if (Date.now() - nav.at > 15000) return false;
+    if (!USER_NAV.has(nav.transitionType)) return false;
+    // 比 origin 而不是完整 URL：SPA 可能在导航之后改写路径
+    return sameOrigin(nav.url, url || nav.url);
+  } catch {
+    return false;
+  }
+}
+
+/** 记下「这次为什么没触发」，界面直接显示，省得开控制台猜 */
+async function noteTriggerSkip(scriptId, reason, url) {
+  try {
+    const got = await chrome.storage.session.get(K_TRIGGER_LOG);
+    const log = got[K_TRIGGER_LOG] || {};
+    log[`skip_${scriptId}`] = { reason, at: Date.now(), url: url || '' };
+    await chrome.storage.session.set({ [K_TRIGGER_LOG]: log });
+  } catch {
+    /* 诊断信息写失败不影响主流程 */
+  }
+}
 
 async function handleTrigger(msg, sender) {
   const scriptId = msg?.scriptId;
   if (!scriptId) throw new Error('缺少 scriptId');
 
+  const url = msg.url || sender?.url || '';
+  const skip = async (reason) => {
+    await noteTriggerSkip(scriptId, reason, url);
+    return { ok: false, skipped: reason };
+  };
+
   const script = await getScript(scriptId);
-  if (!script) return { ok: false, skipped: '脚本已不存在' };
-  if (script.enabled === false) return { ok: false, skipped: '脚本已停用' };
+  if (!script) return skip('脚本已不存在');
+  if (script.enabled === false) return skip('脚本已停用');
 
   const t = normalizeTrigger(script.trigger);
-  if (!t.enabled) return { ok: false, skipped: '触发未启用' };
+  if (!t.enabled) return skip('触发未启用');
 
   // 已经有脚本在跑就不叠加，避免两个自动化互相踩
-  if (running.size > 0) return { ok: false, skipped: '已有脚本正在运行' };
+  if (running.size > 0) return skip('已有脚本正在运行');
 
   const now = Date.now();
   const got = await chrome.storage.session.get(K_TRIGGER_LOG);
   const log = got[K_TRIGGER_LOG] || {};
   const prev = log[scriptId] || {};
 
+  // 用户按 F5 / 重新敲地址 / 点书签 —— 这是新的一次意图
+  const userNav = await isUserNavigation(sender?.tab?.id, url);
+
   if (t.once && msg.loadId && prev.loadId === msg.loadId) {
-    return { ok: false, skipped: '本次页面加载已经触发过' };
+    return skip('本次页面加载已经触发过');
   }
-  if (t.cooldownSec > 0 && prev.at && now - prev.at < t.cooldownSec * 1000) {
+
+  // 冷却只用来防「页面或脚本自己跳转造成的连环触发」。
+  // 用户手动刷新属于新的意图，不该被它拦住 —— 否则就会出现
+  // 「跑过一次之后，怎么刷新都不再触发」。
+  if (!userNav && t.cooldownSec > 0 && prev.at && now - prev.at < t.cooldownSec * 1000) {
     const left = Math.ceil((t.cooldownSec * 1000 - (now - prev.at)) / 1000);
-    return { ok: false, skipped: `冷却中，还要等 ${left} 秒` };
+    return skip(`冷却中，还要等 ${left} 秒（防页面自己跳转连环触发；手动刷新不受限）`);
   }
 
   log[scriptId] = {
     at: now,
     loadId: msg.loadId || null,
-    url: msg.url || sender?.url || '',
-    trigger: 'page',
+    url,
+    trigger: userNav ? 'reload' : 'page',
   };
   await chrome.storage.session.set({ [K_TRIGGER_LOG]: log });
 
   runScript(scriptId, { trigger: 'page' });
-  return { ok: true, started: true };
+  return { ok: true, started: true, reload: userNav };
 }
 
 /* ==================================================================
