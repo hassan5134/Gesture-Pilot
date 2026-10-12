@@ -996,6 +996,71 @@ console.log('\n\x1b[1m[11] 触发条件：等元素 / 等前台\x1b[0m');
   check('  选择器语法错误时安全放弃', s4.length === 0, JSON.stringify(s4.map((m) => m.scriptId)));
 }
 
+  /* ---------------- 步骤匹配条件 ---------------- */
+
+  console.log('\n\x1b[1m[10] 步骤匹配条件（加固定位用）\x1b[0m');
+  const mc = makeContext({ href: 'https://m.test/x' });
+  run(src('content/selector.js'), mc.ctx, 'selector.js');
+  const MM = mc.win.GX;
+
+  // matchesExtra 只依赖 el.matches，这里给最简的假元素就够
+  const elOk = { nodeType: 1, matches: () => true };
+  const elNo = { nodeType: 1, matches: () => false };
+
+  check('不填条件时一律通过', MM.matchesExtra(elOk, '') === true);
+  check('只有空白也等于不填', MM.matchesExtra(elOk, '   ') === true);
+  check('满足条件时通过', MM.matchesExtra(elOk, '.green') === true);
+  check('不满足时挡掉', MM.matchesExtra(elNo, '.green') === false);
+  check('元素为空时挡掉', MM.matchesExtra(null, '.green') === false);
+  check('文本节点挡掉', MM.matchesExtra({ nodeType: 3 }, '.green') === false);
+  check('选择器语法出错按「不匹配」处理，而不是把定位流程带崩',
+    MM.matchesExtra({ nodeType: 1, matches: () => { throw new Error('bad'); } }, '###') === false);
+
+  mc.ctx.document.createDocumentFragment = () => ({
+    querySelector: (t) => {
+      if (t === '###') throw new Error('bad');
+      return null;
+    },
+  });
+  check('isValidSelector 认出坏选择器', MM.isValidSelector('###') === false);
+  check('isValidSelector 放行正常选择器', MM.isValidSelector('.green[href^="/d"]') === true);
+  check('空条件视为合法', MM.isValidSelector('') === true);
+
+  // 有条件时必须逐个筛 —— querySelector 只给第一个，可能正好是不该点的那个
+  const wrong = { nodeType: 1, matches: () => false };
+  const right = { nodeType: 1, matches: () => true };
+  mc.ctx.document.querySelectorAll = () => [wrong, right];
+  check('resolve 跳过条件不符的候选，选中真正那个',
+    MM.resolve(mc.ctx.document, { kind: 'css', value: '#x' }, '.green') === right);
+  mc.ctx.document.querySelectorAll = () => [wrong];
+  check('候选全不符时返回 null —— 于是继续等待，而不是点错元素',
+    MM.resolve(mc.ctx.document, { kind: 'css', value: '#x' }, '.green') === null);
+  mc.ctx.document.querySelector = () => right;
+  check('不填条件时走 querySelector 快路径（不做多余的遍历）',
+    MM.resolve(mc.ctx.document, { kind: 'css', value: '#x' }, '') === right);
+
+  // elementHints：录制时存下的元素特征，编辑界面靠它一键拼条件
+  const hintEl = {
+    nodeType: 1,
+    tagName: 'A',
+    classList: ['btn', 'green', 'btn-1697123456789'],
+    attributes: [
+      { name: 'class', value: 'btn green' },
+      { name: 'style', value: 'color:red' },
+      { name: 'href', value: '/detail?id=1' },
+      { name: 'data-id', value: '7' },
+    ],
+  };
+  const hints = MM.elementHints(hintEl);
+  check('记下可用的 class', hints.cls.includes('btn') && hints.cls.includes('green'), JSON.stringify(hints.cls));
+  check('过滤掉带长数字、会变的那种 class',
+    !hints.cls.some((c) => /1697123456789/.test(c)), JSON.stringify(hints.cls));
+  check('记下 href', hints.attrs.some((a) => a.name === 'href'), JSON.stringify(hints.attrs));
+  check('丢掉 style 这类噪声', !hints.attrs.some((a) => a.name === 'style'));
+  check('保留 data- 属性', hints.attrs.some((a) => a.name === 'data-id'));
+  check('不是元素时返回 null', MM.elementHints({ nodeType: 3 }) === null);
+
+
 console.log('\n' + '─'.repeat(52));
 console.log(`  通过 \x1b[32m${pass}\x1b[0m  失败 \x1b[31m${fail}\x1b[0m`);
 console.log('─'.repeat(52) + '\n');

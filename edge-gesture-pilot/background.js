@@ -15,9 +15,24 @@ import {
   setFailure, getFailure,
   alarmName, scriptIdFromAlarm, newId,
   defaultTrigger, defaultSchedule, normalizeTrigger, normalizeScript,
+  defaultWait, countSteps,
 } from './lib/storage.js';
 
 import { matchesDomain } from './lib/domains.js';
+
+import {
+  makeLogger, configure as configureLog, flushNow,
+  readLogs, clearLogs, logStats,
+} from './lib/logger.js';
+
+import { runUserCode, releaseCdp, releaseAllCdp } from './lib/jsruntime.js';
+
+import {
+  getStatus as driveStatus, setClientId as driveSetClient,
+  connect as driveConnect, disconnect as driveDisconnect,
+  upload as driveUpload, list as driveList,
+  download as driveDownload, prune as drivePrune,
+} from './lib/drive.js';
 
 import {
   attach as cdpAttach, detach as cdpDetach,
@@ -49,8 +64,14 @@ async function bootstrap() {
   await chrome.storage.session
     .setAccessLevel({ accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS' })
     .catch(() => {});
+  // 日志开关在 SW 重启后是空的，必须重新读一次设置
+  const settings = await getSettings();
+  configureLog({ debug: settings.debug, logLimit: settings.logLimit });
   // 浏览器重启后 storage.session 被清空，录制状态需要复位
   await setRecordIcon(false);
+  // 上次残留的调试连接（SW 被回收时来不及断开）在这里清掉，
+  // 否则页面顶部的「正在调试」提示条会一直挂着
+  await releaseAllCdp().catch(() => {});
   await syncAlarms();
   await syncOffscreen().catch(() => {});
   await syncContextMenus().catch(() => {});
@@ -174,7 +195,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     }
     const id = scriptIdFromAlarm(alarm.name);
     if (!id) return;
-    await runScript(id, { trigger: 'schedule' });
+    // 定时也是「自动」路径，同样受冷却约束 ——
+    // 周期再短也不会突破冷却，用户配错了也不会把页面点烂
+    const slot = await acquireAutoSlot(id, 'schedule');
+    if (slot.ok) await runScript(id, { trigger: 'schedule' });
     // daily 是一次性 alarm，跑完重排下一次（这样能自然跨过夏令时）
     const s = await getScript(id);
     if (s?.schedule?.enabled && s.schedule.mode === 'daily') {
@@ -206,7 +230,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // offscreen 上行
   if (msg.type === 'GX_TIMER_FIRE') {
-    runScript(msg.scriptId, { trigger: 'schedule' });
+    (async () => {
+      const slot = await acquireAutoSlot(msg.scriptId, 'schedule');
+      if (slot.ok) await runScript(msg.scriptId, { trigger: 'schedule' });
+    })().catch(() => {});
     return;
   }
   if (msg.type === 'GX_TIMER_READY') {
@@ -286,6 +313,9 @@ async function stopRecording() {
     enabled: true,
     engine: null, // null = 跟随全局设置
     schedule: defaultSchedule(),
+    // 一段录制 = 一个手势事件。之后可以在界面上插入 JS 事件、调整顺序，
+    // 或者给步骤补匹配条件，凑成完整的执行流程。
+    events: [{ type: 'gesture', name: '手势', wait: defaultWait(), steps }],
   });
 
   await saveScript(script);
@@ -324,6 +354,7 @@ async function route(msg, sender) {
         settings: await getSettings(),
         run: await getRunState(),
         triggerLog: got[K_TRIGGER_LOG] || {},
+        logStats: await logStats(),
       };
     }
 
@@ -373,8 +404,11 @@ async function route(msg, sender) {
       let skipped = 0;
 
       for (const raw of incoming) {
-        // 结构不完整的直接跳过，不让一条坏数据毁掉整次导入
-        if (!raw || typeof raw !== 'object' || !Array.isArray(raw.steps) || !raw.steps.length) {
+        // 结构不完整的直接跳过，不让一条坏数据毁掉整次导入。
+        // 能接受两种形态：新结构（events）和老结构（扁平 steps）。
+        const hasEvents = Array.isArray(raw?.events) && raw.events.length > 0;
+        const hasSteps = Array.isArray(raw?.steps) && raw.steps.length > 0;
+        if (!raw || typeof raw !== 'object' || (!hasEvents && !hasSteps)) {
           skipped++;
           continue;
         }
@@ -411,9 +445,43 @@ async function route(msg, sender) {
     case 'RUN_STATE':
       return { ok: true, run: await getRunState() };
 
+    /* ---------- Google Drive 云备份 ---------- */
+    case 'DRIVE_STATUS':
+      return { ok: true, drive: await driveStatus() };
+
+    case 'DRIVE_SET_CLIENT':
+      return { ok: true, drive: await driveSetClient(msg.clientId) };
+
+    case 'DRIVE_CONNECT':
+      return { ok: true, drive: await driveConnect() };
+
+    case 'DRIVE_DISCONNECT':
+      return { ok: true, ...(await driveDisconnect()) };
+
+    case 'DRIVE_BACKUP':
+      return { ok: true, ...(await doCloudBackup()) };
+
+    case 'DRIVE_LIST':
+      return { ok: true, files: await driveList() };
+
+    case 'DRIVE_RESTORE':
+      return { ok: true, ...(await doCloudRestore(msg.fileId)) };
+
+    /* ---------- 执行日志 ---------- */
+    case 'LOG_READ':
+      return { ok: true, logs: await readLogs(), stats: await logStats() };
+
+    case 'LOG_CLEAR':
+      await clearLogs();
+      return { ok: true, stats: await logStats() };
+
+    case 'LOG_STATS':
+      return { ok: true, stats: await logStats() };
+
     /* ---------- 设置 ---------- */
     case 'SETTINGS_SAVE': {
       const s = await saveSettings(msg.patch || {});
+      configureLog({ debug: s.debug, logLimit: s.logLimit });
       await syncAlarms();
       await syncOffscreen().catch(() => {});
       return { ok: true, settings: s };
@@ -422,6 +490,59 @@ async function route(msg, sender) {
     default:
       throw new Error(`未知消息类型：${msg.type}`);
   }
+}
+
+/* ==================================================================
+ * Google Drive 备份
+ *
+ * 备份文件的格式与「导出 JSON」完全一致，所以云端导出的文件
+ * 可以直接用本地导入还原，反过来也一样。
+ * ================================================================== */
+
+function stampName(prefix, ext) {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${prefix}-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}.${ext}`;
+}
+
+async function doCloudBackup() {
+  const scripts = await listScripts();
+  const settings = await getSettings();
+
+  const payload = {
+    format: 'gesture-pilot-scripts',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    count: scripts.length,
+    scripts,
+    // 设置一起存下来，换台机器恢复时不用重新配一遍
+    settings,
+  };
+
+  const file = await driveUpload(stampName('gesture-pilot', 'json'), JSON.stringify(payload, null, 2));
+  // 只保留最近若干份，不然自动备份攒久了会把 Drive 塞满
+  const pruned = await drivePrune().catch(() => ({ removed: 0 }));
+  return { file, pruned: pruned.removed, count: scripts.length };
+}
+
+async function doCloudRestore(fileId) {
+  if (!fileId) throw new Error('没有指定要恢复哪一份备份');
+
+  const text = await driveDownload(fileId);
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`这份备份不是合法的 JSON：${e?.message || e}`);
+  }
+
+  const incoming = Array.isArray(parsed) ? parsed : parsed?.scripts || [];
+  if (!Array.isArray(incoming) || !incoming.length) throw new Error('这份备份里没有任务');
+
+  // 走和本地导入完全相同的那条路：同 id 跳过、结构不全的跳过，
+  // 所以恢复是「补充」而不是「覆盖」，不会把你现在的配置冲掉
+  const r = await route({ type: 'SCRIPT_IMPORT', scripts: incoming });
+  return { added: r.added, skipped: r.skipped, from: parsed?.exportedAt || '' };
 }
 
 /* ==================================================================
@@ -674,6 +795,50 @@ async function noteTriggerSkip(scriptId, reason, url) {
   }
 }
 
+/* ---------------- 冷却：所有自动路径共用 ---------------- */
+
+/**
+ * 自动触发（定时 / 页面加载 / 刷新）统一走这里：冷却没结束就不放行。
+ *
+ * 手动运行不经过它 —— 用户明确点了「运行」，那是新的意图，
+ * 不该被防重复的闸门挡着。
+ */
+async function acquireAutoSlot(taskId, trigger) {
+  const task = await getScript(taskId);
+  if (!task) return { ok: false, reason: '任务已不存在' };
+  if (task.enabled === false) return { ok: false, reason: '任务已停用' };
+
+  const cd = Math.max(0, Number(task.trigger?.cooldownSec) || 0);
+  if (cd > 0) {
+    const got = await chrome.storage.session.get(K_TRIGGER_LOG);
+    const prev = (got[K_TRIGGER_LOG] || {})[taskId];
+    if (prev?.at) {
+      const left = cd * 1000 - (Date.now() - prev.at);
+      if (left > 0) {
+        return { ok: false, reason: `冷却中，还要等 ${Math.ceil(left / 1000)} 秒（手动运行不受此限制）` };
+      }
+    }
+  }
+
+  await markFired(taskId, trigger);
+  return { ok: true };
+}
+
+/** 记录一次触发，供冷却与「上次触发」显示使用 */
+async function markFired(taskId, trigger, loadId, url) {
+  const got = await chrome.storage.session.get(K_TRIGGER_LOG);
+  const log = got[K_TRIGGER_LOG] || {};
+  const prev = log[taskId] || {};
+  log[taskId] = {
+    ...prev,
+    at: Date.now(),
+    trigger,
+    ...(loadId !== undefined ? { loadId } : {}),
+    ...(url !== undefined ? { url } : {}),
+  };
+  await chrome.storage.session.set({ [K_TRIGGER_LOG]: log });
+}
+
 async function handleTrigger(msg, sender) {
   const scriptId = msg?.scriptId;
   if (!scriptId) throw new Error('缺少 scriptId');
@@ -706,12 +871,12 @@ async function handleTrigger(msg, sender) {
     return skip('本次页面加载已经触发过');
   }
 
-  // 冷却只用来防「页面或脚本自己跳转造成的连环触发」。
-  // 用户手动刷新属于新的意图，不该被它拦住 —— 否则就会出现
-  // 「跑过一次之后，怎么刷新都不再触发」。
-  if (!userNav && t.cooldownSec > 0 && prev.at && now - prev.at < t.cooldownSec * 1000) {
+  // 冷却对所有自动路径一视同仁：页面加载、刷新、定时都受它约束。
+  // 只有手动点「运行」/ 快捷键时豁免 —— 那条路径根本不经过这里。
+  // （上一版让「用户刷新绕过冷却」，结果变成怎么刷都触发，反而更难预期。）
+  if (t.cooldownSec > 0 && prev.at && now - prev.at < t.cooldownSec * 1000) {
     const left = Math.ceil((t.cooldownSec * 1000 - (now - prev.at)) / 1000);
-    return skip(`冷却中，还要等 ${left} 秒（防页面自己跳转连环触发；手动刷新不受限）`);
+    return skip(`冷却中，还要等 ${left} 秒（手动运行不受此限制）`);
   }
 
   log[scriptId] = {
@@ -731,45 +896,160 @@ async function handleTrigger(msg, sender) {
  * ================================================================== */
 
 class StepError extends Error {
-  constructor(index, step, detail) {
-    super(`第 ${index + 1} 步失败：${detail}`);
-    this.index = index;
+  constructor({ eventIndex, eventName, stepIndex, step, detail }) {
+    const where = eventName ? `事件「${eventName}」` : `第 ${eventIndex + 1} 个事件`;
+    super(`${where}的第 ${stepIndex + 1} 步失败：${detail}`);
+    this.eventIndex = eventIndex;
+    this.stepIndex = stepIndex;
     this.step = step;
   }
 }
 
+class EventError extends Error {
+  constructor(index, event, detail) {
+    const name = event?.name ? `「${event.name}」` : '';
+    super(`第 ${index + 1} 个事件${name}失败：${detail}`);
+    this.eventIndex = index;
+    this.event = event;
+  }
+}
+
+function describeEvent(ev) {
+  if (ev.type === 'js') {
+    const head = firstLine(ev.name || ev.code || '');
+    return `JS · ${truncate(head, 20)}`;
+  }
+  return `手势 · ${ev.steps?.length || 0} 步`;
+}
+
+/** 取第一行，用来给没有名字的 JS 事件起个摘要 */
+function firstLine(s) {
+  const t = String(s || '').trim();
+  const m = t.match(/[^\r\n]*/);
+  return (m ? m[0] : t).trim();
+}
+
+/* ---------------- 事件闸门 ---------------- */
+
+/**
+ * 事件执行前的等待闸门。
+ *
+ *   wait.url      —— 等地址栏变成匹配的样子（上一个事件可能刚触发了跳转）
+ *   wait.selector —— 等元素出现（给 SPA 渲染留时间，比固定延迟可靠得多）
+ *
+ * 等不到只跳过这一个事件，不整条任务失败：「页面这次渲染慢了」这种瞬时问题
+ * 不该连累后面本来能跑的事件。需要严格时在事件上勾 fatal。
+ */
+async function passEventGate(ev, tabId, log) {
+  const w = ev.wait || {};
+  const budget = Math.max(1, Number(w.timeoutSec) || 20) * 1000;
+
+  if (w.url) {
+    log.info('等待地址匹配', { pattern: w.url, timeoutSec: Math.round(budget / 1000) });
+    const ok = await waitForTabUrl(tabId, w.url, budget);
+    if (!ok) {
+      const cur = (await chrome.tabs.get(tabId).catch(() => null))?.url || '';
+      return { ok: false, reason: `等不到地址匹配「${w.url}」（当前是 ${hostOf(cur)}）` };
+    }
+    log.ok('地址已匹配', { url: (await chrome.tabs.get(tabId).catch(() => null))?.url || '' });
+  }
+
+  if (w.selector) {
+    log.info('等待元素出现', { selector: w.selector, timeoutSec: Math.round(budget / 1000) });
+    const ok = await waitForSelectorInTab(tabId, w.selector, budget);
+    if (!ok) return { ok: false, reason: `等不到元素「${w.selector}」` };
+    log.ok('元素已出现', { selector: w.selector });
+  }
+
+  return { ok: true };
+}
+
+async function waitForTabUrl(tabId, pattern, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (matchesDomain(tab?.url || '', [pattern])) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(250);
+  }
+}
+
+/**
+ * 轮询页面里有没有这个元素。
+ * 用 executeScript 而不是给内容脚本发消息：静态 content script 对
+ * 「扩展加载之前就打开的标签页」不生效，而这里恰恰经常跑在这种页面上。
+ * 注入的 func 必须是自包含的，不能引用外部变量。
+ */
+async function waitForSelectorInTab(tabId, selector, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let found = false;
+    try {
+      const r = await chrome.scripting.executeScript({
+        target: { tabId, frameIds: [0] },
+        func: (sel) => {
+          try {
+            return !!document.querySelector(sel);
+          } catch {
+            return false;
+          }
+        },
+        args: [selector],
+      });
+      found = r?.[0]?.result === true;
+    } catch {
+      found = false;
+    }
+    if (found) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(250);
+  }
+}
+
+/* ---------------- 主流程 ---------------- */
+
 async function runScript(id, ctx = {}) {
-  if (running.has(id)) return { ok: false, error: '该脚本正在运行中' };
+  if (running.has(id)) return { ok: false, error: '该任务正在运行中' };
   running.add(id);
 
   const startedAt = Date.now();
+  const trigger = ctx.trigger || 'manual';
   let tabId = null;
-  let scriptName = '';
+  let taskName = '';
   let engine = 'synthetic';
+  let cdpTouched = false;
+  let log = makeLogger({ taskId: id });
+  const skips = [];
 
   try {
     // 新一轮开始，清掉上一次的失败留证
     await setFailure(null);
 
-    const script = await getScript(id);
-    if (!script) throw new Error('脚本不存在或已被删除');
-    if (!script.steps?.length) throw new Error('脚本没有任何步骤');
+    const task = await getScript(id);
+    if (!task) throw new Error('任务不存在或已被删除');
 
-    scriptName = script.name;
+    const events = (task.events || []).filter((e) => e.enabled !== false);
+    if (!events.length) throw new Error('任务里没有启用的事件');
+
+    taskName = task.name;
     const settings = await getSettings();
-    engine = script.engine || settings.engine;
-    const total = script.steps.length;
+    configureLog({ debug: settings.debug, logLimit: settings.logLimit });
+    log = makeLogger({ taskId: id, taskName });
+    engine = task.engine || settings.engine;
 
-    const base = { scriptId: id, scriptName, startedAt, trigger: ctx.trigger || 'manual', engine };
+    const total = countSteps(task);
+    const base = { scriptId: id, scriptName: taskName, startedAt, trigger, engine };
 
-    const tab = await ensureTargetTab(script);
+    log.info('任务开始', { trigger, engine, events: events.length, steps: total });
+
+    const tab = await ensureTargetTab(task);
     tabId = tab.id;
+    log.info('目标页面', { url: tab.url || '', tabId });
 
-    // 生效域名守卫：只约束「定时」这一条自动路径。
-    // 页面加载触发有它自己的 domains（内容脚本侧已经筛过），
+    // 生效域名守卫：只约束自动路径（定时 / 页面加载触发）。
     // 手动运行是明确的用户意图，不受限制。
-    if (ctx.trigger === 'schedule') {
-      const allowed = script.schedule?.domains || [];
+    if (trigger !== 'manual') {
+      const allowed = task.schedule?.domains || [];
       if (allowed.length && !matchesDomain(tab.url || '', allowed)) {
         throw new Error(
           `当前页面 ${hostOf(tab.url)} 不在生效域名范围内，已跳过（生效域名：${allowed.join('、')}）`,
@@ -779,64 +1059,176 @@ async function runScript(id, ctx = {}) {
 
     await setRunState({ ...base, status: 'running', index: 0, total, tabId, phase: '准备页面' });
 
-    const frameMap = await injectFrames(tabId);
-    if (engine === 'cdp') await cdpAttach(tabId);
-
-    // 回放时也在页面上给出实时反馈
-    const hudOn = settings.hud !== false;
-    if (hudOn) await broadcast(tabId, { type: 'GX_HUD_ON', label: '回放中' });
-
+    const hudWanted = settings.hud !== false;
+    let hudOn = false;
     const cursor = { last: null };
+    let frameMap = null;
+    let done = 0;
+
+    const injectOnce = async () => {
+      if (!frameMap) frameMap = await injectFrames(tabId);
+      return frameMap;
+    };
+    const lightHud = async (label) => {
+      if (!hudWanted || hudOn) return;
+      await broadcast(tabId, { type: 'GX_HUD_ON', label });
+      hudOn = true;
+    };
+    const eventState = (ei, phase) => ({
+      ...base, status: 'running', index: done, total, tabId,
+      eventIndex: ei, events: events.length, phase,
+    });
 
     try {
-      for (let i = 0; i < script.steps.length; i++) {
-        const step = script.steps[i];
+      for (let ei = 0; ei < events.length; ei++) {
+        const ev = events[ei];
+        const elog = makeLogger({
+          taskId: id,
+          taskName,
+          eventIndex: ei,
+          eventName: ev.name || `事件 ${ei + 1}`,
+        });
 
-        const gap = computeGap(step, i, settings);
-        if (gap > 0) await sleep(gap);
+        await setRunState(eventState(ei, `事件 ${ei + 1}/${events.length} · ${describeEvent(ev)}`));
 
-        await setRunState({ ...base, status: 'running', index: i, total, tabId, phase: describeStep(step) });
-        if (hudOn) broadcast(tabId, { type: 'GX_HUD_TICK', count: i + 1 });
-
-        const frameId = resolveFrameId(frameMap, step);
-        const frameIsTop = !!frameMap.find((f) => f.frameId === frameId)?.top;
-        let res = await dispatchStep(tabId, frameId, step, settings, engine, cursor, frameIsTop);
-
-        const retries = Math.max(0, Number(settings.retry) || 0);
-        for (let a = 0; !res.ok && a < retries; a++) {
-          await sleep(800);
-          res = await dispatchStep(tabId, frameId, step, settings, engine, cursor, frameIsTop);
+        // ---- 闸门：等地址 / 等元素 ----
+        const gate = await passEventGate(ev, tabId, elog);
+        if (!gate.ok) {
+          elog.warn('事件被跳过', { reason: gate.reason });
+          skips.push({ eventIndex: ei, eventName: ev.name || `事件 ${ei + 1}`, reason: gate.reason });
+          if (ev.wait?.fatal) throw new EventError(ei, ev, gate.reason);
+          continue;
         }
 
-        if (!res.ok) throw new StepError(i, step, res.error || '未知错误');
+        // ---- JS 事件 ----
+        if (ev.type === 'js') {
+          const code = String(ev.code || '');
+          if (!code.trim()) {
+            elog.warn('JS 事件里没有代码，跳过');
+            skips.push({ eventIndex: ei, eventName: ev.name || `事件 ${ei + 1}`, reason: 'JS 事件里没有代码' });
+            continue;
+          }
+
+          elog.info('执行 JS 事件', { world: ev.world || 'auto', chars: code.length });
+          const r = await runUserCode({
+            tabId,
+            frameId: 0,
+            code,
+            world: ev.world || 'auto',
+            timeoutMs: Math.max(5000, (Number(settings.stepTimeout) || 8000) * 3),
+            context: { task: taskName, event: ev.name || `事件 ${ei + 1}` },
+            log: elog,
+          });
+          if (r.via === 'cdp') cdpTouched = true;
+
+          if (!r.ok) throw new EventError(ei, ev, r.error);
+          elog.ok('JS 事件完成', {
+            via: r.via,
+            fellBack: !!r.fellBack,
+            value: r.value === undefined ? '(无返回值)' : r.value,
+          });
+
+          done += 1;
+          if (hudOn) broadcast(tabId, { type: 'GX_HUD_TICK', count: done });
+          await flushNow();
+          continue;
+        }
+
+        // ---- 手势事件 ----
+        const steps = ev.steps || [];
+        if (!steps.length) {
+          elog.warn('手势事件里没有步骤，跳过');
+          skips.push({ eventIndex: ei, eventName: ev.name || `事件 ${ei + 1}`, reason: '手势事件里没有步骤' });
+          continue;
+        }
+
+        const map = await injectOnce();
+        if (engine === 'cdp' && !cdpTouched) {
+          await cdpAttach(tabId);
+          cdpTouched = true;
+        }
+        await lightHud('回放中');
+
+        for (let si = 0; si < steps.length; si++) {
+          const step = steps[si];
+          const gap = computeGap(step, si, settings);
+          if (gap > 0) await sleep(gap);
+
+          const label = describeStep(step);
+          await setRunState(eventState(ei, `事件 ${ei + 1}/${events.length} · ${label}`));
+          if (hudOn) broadcast(tabId, { type: 'GX_HUD_TICK', count: done + 1 });
+          elog.info(`步骤 ${si + 1}/${steps.length}`, { step: label, delayMs: Math.round(gap) });
+
+          const frameId = resolveFrameId(map, step);
+          const frameIsTop = !!map.find((f) => f.frameId === frameId)?.top;
+          const args = [tabId, frameId, step, settings, engine, cursor, frameIsTop];
+          let res = await dispatchStep(...args);
+
+          const retries = Math.max(0, Number(settings.retry) || 0);
+          for (let a = 0; !res.ok && a < retries; a++) {
+            await sleep(800);
+            elog.warn(`步骤重试 ${a + 1}/${retries}`, { error: res.error });
+            res = await dispatchStep(...args);
+          }
+
+          if (!res.ok) {
+            throw new StepError({
+              eventIndex: ei,
+              eventName: ev.name || `事件 ${ei + 1}`,
+              stepIndex: si,
+              step,
+              detail: res.error || '未知错误',
+            });
+          }
+          done += 1;
+        }
+
+        elog.ok('手势事件完成', { steps: steps.length });
+        await flushNow();
       }
     } finally {
       if (hudOn) await broadcast(tabId, { type: 'GX_HUD_OFF' });
-      if (engine === 'cdp') await cdpDetach(tabId);
+      // 手势的 CDP 引擎和 JS 事件的降级路径共用同一个调试连接，
+      // 这里统一断开，页面上的「正在调试」提示条才会消失
+      if (engine === 'cdp' || cdpTouched) {
+        await cdpDetach(tabId).catch(() => {});
+        await releaseCdp(tabId).catch(() => {});
+      }
     }
 
     const finishedAt = Date.now();
     await setRunState({
-      ...base, status: 'success', index: total, total, tabId,
+      ...base, status: 'success', index: total, total, tabId, skips,
       finishedAt, duration: finishedAt - startedAt, phase: '完成',
     });
+    log.ok('任务完成', { durationMs: finishedAt - startedAt, steps: done, skipped: skips.length });
+    await flushNow();
     await clearBadge();
     return { ok: true };
-
   } catch (e) {
     const run = await getRunState();
     const failure = {
       scriptId: id,
-      scriptName,
+      scriptName: taskName,
       error: String(e?.message || e),
-      stepIndex: e instanceof StepError ? e.index : null,
+      stepIndex: e instanceof StepError ? e.stepIndex : null,
       step: e instanceof StepError ? e.step : null,
+      eventIndex: e instanceof StepError || e instanceof EventError ? e.eventIndex : null,
+      event: e instanceof EventError ? e.event : null,
       at: Date.now(),
       engine,
     };
+
+    log.error('任务失败', {
+      error: failure.error,
+      eventIndex: failure.eventIndex,
+      stepIndex: failure.stepIndex,
+    });
+    await flushNow();
+
     await setFailure(failure);
     await setRunState({
-      ...(run || { scriptId: id, scriptName, startedAt }),
+      ...(run || { scriptId: id, scriptName: taskName, startedAt }),
       status: 'failed',
       finishedAt: Date.now(),
       duration: Date.now() - startedAt,
@@ -844,10 +1236,9 @@ async function runScript(id, ctx = {}) {
     });
 
     await captureFailure(tabId).catch(() => {});
-    await notify('手势助手 · 执行失败', `${scriptName}：${failure.error}`).catch(() => {});
+    await notify('手势助手 · 执行失败', `${taskName}：${failure.error}`).catch(() => {});
     await setBadgeFailure();
     return { ok: false, error: failure.error };
-
   } finally {
     running.delete(id);
   }

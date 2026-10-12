@@ -75,6 +75,25 @@
         <label class="sw"><input type="checkbox" data-set="humanize" /> 鼠标轨迹自然化（曲线 + 抖动）</label>
         <label class="sw"><input type="checkbox" data-set="notifyOnFail" /> 执行失败时发送桌面通知</label>
 
+        <hr class="sep" />
+
+        <h3 class="sect">执行日志</h3>
+        <label class="sw"><input type="checkbox" data-set="debug" /> Debug：记录每一步的执行过程</label>
+        <div class="grid">
+          <div class="field">
+            <label for="s-logLimit">条数上限（超出丢最旧的）</label>
+            <input id="s-logLimit" type="number" min="50" max="50000" step="50" data-set="logLimit" />
+          </div>
+        </div>
+        <div class="row">
+          <button class="btn" id="btnOpenLogs">打开日志查看器</button>
+          <span class="dim" id="logStat"></span>
+        </div>
+        <p class="hint">
+          关着的时候埋点在第一步就返回，开销可以忽略 —— 出问题再打开就行。
+          日志存在浏览器本地，不占额外权限，也不会外传。
+        </p>
+
         <p class="hint">
           修改会自动保存。<strong>秒级周期</strong>（&lt; 60 秒）由 offscreen 文档驱动；
           <strong>分钟级及以上</strong>走 chrome.alarms，Service Worker 被回收也不会丢。
@@ -103,6 +122,36 @@
           在页面任意位置右键也能用。改键位去
           <code>edge://extensions/shortcuts</code>。
         </p>
+
+        <hr class="sep" />
+
+        <h3 class="sect">云备份（Google Drive）</h3>
+        <p class="hint">
+          要你自己建一个 OAuth 客户端，一次性，免费：<br />
+          1. 在 Google Cloud 建项目，启用 <strong>Google Drive API</strong><br />
+          2. 建 OAuth 客户端 ID，类型选 <strong>Web 应用</strong><br />
+          3. 把下面这个<strong>重定向 URI</strong> 填进它的「已获授权的重定向 URI」<br />
+          拿到的 Client ID 粘进来即可。备份只存到本应用自己的文件夹，读不到你 Drive 里的其他东西。
+        </p>
+
+        <div class="row">
+          <code class="redir" id="driveRedirect">读取中…</code>
+          <button class="btn" id="btnCopyRedirect">复制</button>
+        </div>
+
+        <div class="field">
+          <label for="driveClient">OAuth Client ID</label>
+          <input id="driveClient" type="text" placeholder="xxxxxxxxxx.apps.googleusercontent.com" />
+        </div>
+
+        <div class="row">
+          <button class="btn" id="btnDriveConnect">连接 Google Drive</button>
+          <button class="btn" id="btnDriveBackup">立即备份</button>
+          <button class="btn" id="btnDriveList">云端备份</button>
+          <button class="btn icon" id="btnDriveOff" title="断开并清除本地令牌">断开</button>
+        </div>
+        <div class="dim" id="driveMsg"></div>
+        <div class="drive-files" id="driveFiles"></div>
       </section>
     </main>
 

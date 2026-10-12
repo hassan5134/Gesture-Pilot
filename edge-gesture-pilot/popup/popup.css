@@ -600,3 +600,190 @@ textarea:focus { outline: none; border-color: var(--blue); }
   background: var(--blue);
   transition: width 0.25s;
 }
+
+/* ================= 事件组 ================= */
+
+.ev-list {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.ev-list-hd {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 9px;
+  background: var(--bg-3);
+  border-bottom: 1px solid var(--line);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.event { border-bottom: 1px solid var(--line); background: var(--bg); }
+.event:last-child { border-bottom: 0; }
+
+.ev-hd { display: flex; align-items: center; gap: 6px; padding: 6px 8px; }
+
+.ev-kind {
+  flex: none;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  letter-spacing: 0.02em;
+}
+
+.ev-kind.gesture { background: var(--blue-bg); color: var(--blue); }
+.ev-kind.js { background: #f2e9fb; color: #6b3fa0; }
+
+.ev-name {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid transparent;
+  background: none;
+  border-radius: 4px;
+  padding: 2px 5px;
+  color: var(--ink);
+}
+
+.ev-name:hover { border-color: var(--line); }
+.ev-name:focus { outline: none; border-color: var(--blue); background: var(--bg); }
+
+.ev-wait {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px 6px;
+  font-size: 10.5px;
+}
+
+.ev-wait input {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 5px;
+  font: inherit;
+  font-size: 11px;
+  background: var(--bg);
+  color: var(--ink);
+  min-width: 0;
+}
+
+.ev-wait input:focus { outline: none; border-color: var(--blue); }
+
+.ev-js { padding: 0 8px 8px; }
+
+.ev-js-meta {
+  display: flex;
+  gap: 8px;
+  font-size: 10.5px;
+  color: var(--ink-3);
+  margin-bottom: 5px;
+}
+
+.ev-code {
+  margin: 0 0 6px;
+  padding: 7px 8px;
+  background: var(--bg-3);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.5;
+  max-height: 132px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--ink-2);
+}
+
+.mini {
+  flex: none;
+  border: 0;
+  background: none;
+  color: var(--ink-3);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.mini:hover { color: var(--blue); background: var(--bg-3); }
+
+.step-match { gap: 4px; }
+
+.step-match .match {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #d9c07a;
+  background: #fdf9ec;
+  border-radius: 4px;
+  padding: 2px 5px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--ink);
+}
+
+.step-match .match:focus { outline: none; border-color: var(--amber); }
+
+.chips { display: flex; gap: 3px; flex-wrap: wrap; }
+
+.chip {
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--ink-2);
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.chip:hover { border-color: var(--blue); color: var(--blue); }
+
+.btn.danger, .btn.danger:hover { color: var(--red); border-color: var(--red); }
+
+/* 执行结果里被跳过的事件 */
+.skips {
+  margin-top: 7px;
+  padding: 6px 8px;
+  background: var(--amber-bg);
+  border-radius: 5px;
+  font-size: 10.5px;
+  color: var(--amber);
+  line-height: 1.5;
+}
+
+/* ================= 云备份 ================= */
+
+.redir {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  background: var(--bg-3);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 10px;
+  color: var(--ink-2);
+  word-break: break-all;
+}
+
+.drive-files { margin-top: 7px; display: flex; flex-direction: column; gap: 3px; }
+
+.drive-file {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 7px;
+  background: var(--bg-3);
+  border-radius: 5px;
+  font-size: 11px;
+}
+
+.drive-file .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drive-file .btn { padding: 2px 8px; font-size: 11px; }

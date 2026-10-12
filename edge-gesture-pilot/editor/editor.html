@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>编辑 JS 事件 · Gesture Pilot</title>
+    <style>
+      :root {
+        --bg: #ffffff;
+        --bg-2: #f7f8fa;
+        --bg-3: #eef1f5;
+        --line: #e3e7ee;
+        --ink: #1c2230;
+        --ink-2: #5b6472;
+        --ink-3: #8b94a3;
+        --blue: #185fa5;
+        --blue-bg: #e6f1fb;
+        --green: #0f6e56;
+        --red: #a32d2d;
+        --amber: #854f0b;
+        --amber-bg: #faeeda;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font: 13px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+        color: var(--ink);
+        background: var(--bg-2);
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 11px 18px;
+        background: var(--bg);
+        border-bottom: 1px solid var(--line);
+        position: sticky;
+        top: 0;
+        z-index: 5;
+      }
+      .title { font-weight: 600; }
+      .sub { color: var(--ink-3); font-size: 12px; }
+      .grow { flex: 1; }
+      .wrap {
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 16px 18px 40px;
+        display: grid;
+        grid-template-columns: 1fr 258px;
+        gap: 16px;
+      }
+      @media (max-width: 760px) { .wrap { grid-template-columns: 1fr; } }
+      .panel {
+        background: var(--bg);
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        overflow: hidden;
+      }
+      .panel-hd {
+        padding: 8px 12px;
+        border-bottom: 1px solid var(--line);
+        background: var(--bg-3);
+        font-size: 12px;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      textarea {
+        width: 100%;
+        min-height: 460px;
+        border: 0;
+        padding: 12px 14px;
+        font-family: ui-monospace, Menlo, Consolas, "Courier New", monospace;
+        font-size: 12.5px;
+        line-height: 1.65;
+        resize: vertical;
+        background: var(--bg);
+        color: var(--ink);
+        tab-size: 2;
+      }
+      textarea:focus { outline: none; }
+      .foot {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 9px 12px;
+        border-top: 1px solid var(--line);
+        background: var(--bg-2);
+      }
+      button {
+        font: inherit;
+        font-size: 12px;
+        padding: 5px 11px;
+        border-radius: 6px;
+        border: 1px solid var(--line);
+        background: var(--bg);
+        color: var(--ink);
+        cursor: pointer;
+      }
+      button:hover { border-color: var(--blue); color: var(--blue); }
+      button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+      button.primary:hover { color: #fff; opacity: .9; }
+      button:disabled { opacity: .5; cursor: default; }
+      .status { font-size: 12px; color: var(--ink-3); }
+      .status.ok { color: var(--green); }
+      .status.err { color: var(--red); }
+      .dirty { color: var(--amber); }
+      .api { font-size: 11.5px; }
+      .api h4 {
+        margin: 0;
+        padding: 9px 12px 4px;
+        font-size: 11px;
+        color: var(--ink-3);
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: .04em;
+      }
+      .api dl { margin: 0; padding: 0 12px 10px; }
+      .api dt {
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 11px;
+        color: var(--blue);
+        margin-top: 7px;
+      }
+      .api dd { margin: 1px 0 0; color: var(--ink-2); font-size: 11px; line-height: 1.45; }
+      .note {
+        margin: 0;
+        padding: 9px 12px;
+        font-size: 11.5px;
+        color: var(--ink-2);
+        line-height: 1.55;
+        border-top: 1px solid var(--line);
+        background: var(--amber-bg);
+      }
+      code {
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        background: var(--bg-3);
+        padding: 1px 4px;
+        border-radius: 3px;
+        font-size: 11px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span class="title" id="evName">JS 事件</span>
+      <span class="sub" id="taskName"></span>
+      <span class="grow"></span>
+      <button id="btnClose">关闭</button>
+      <button class="primary" id="btnSave">保存</button>
+    </header>
+
+    <div class="wrap">
+      <div class="panel">
+        <div class="panel-hd">
+          代码
+          <span class="grow"></span>
+          <span class="status" id="status"></span>
+        </div>
+        <textarea id="code" spellcheck="false" placeholder="在这里写 JavaScript。可以直接用 await，可以 return 一个值（会记进执行日志）。"></textarea>
+        <div class="foot">
+          <button class="primary" id="btnSave2">保存 (Ctrl+S)</button>
+          <button id="btnFormat">整理缩进</button>
+          <button id="btnReset">还原</button>
+        </div>
+      </div>
+
+      <div class="panel api">
+        <div class="panel-hd">可用的 gp 工具</div>
+        <h4>页面</h4>
+        <dl>
+          <dt>gp.url / gp.title</dt>
+          <dd>当前页面地址与标题</dd>
+          <dt>gp.task</dt>
+          <dd>当前任务名</dd>
+          <dt>gp.$(sel) / gp.$$(sel)</dt>
+          <dd>查单个 / 查全部，等价于 querySelector</dd>
+          <dt>gp.waitFor(sel, ms)</dt>
+          <dd>等元素出现，超时返回 null</dd>
+          <dt>gp.sleep(ms)</dt>
+          <dd>等待</dd>
+          <dt>gp.log(...)</dt>
+          <dd>写进执行日志（开了 debug 才记）</dd>
+        </dl>
+        <h4>说明</h4>
+        <dl>
+          <dt>console.log</dt>
+          <dd>会被捕获进执行日志，同时照常打到页面控制台</dd>
+          <dt>返回值</dt>
+          <dd>用 return 交回来，会显示在日志里，方便确认这段代码到底爬到了什么</dd>
+          <dt>执行上下文</dt>
+          <dd>页面主世界，能访问页面自己的变量（jQuery、React 实例等）</dd>
+        </dl>
+        <p class="note">
+          默认先用轻量注入执行；如果站点 CSP 禁止 eval，会自动改用调试接口重试
+          （页面顶部会出现「正在调试此浏览器」提示条）。
+        </p>
+      </div>
+    </div>
+
+    <script src="editor.js" type="module"></script>
+  </body>
+</html>

@@ -10,15 +10,17 @@ Edge / Chromium 的 Manifest V3 扩展，用来辅助重复性的页面操作。
 
 ## 能做什么
 
-- **录一次，反复跑** —— 捕获点击、输入、下拉选择、按键、滚动，以及**拖拽**
-- **两套回放引擎** —— 合成事件（轻量、无额外权限提示），或 `chrome.debugger` 投递的真实 CDP 输入（`isTrusted === true`）
-- **三种触发方式** —— 手动、定时（`chrome.alarms` / offscreen）、**页面加载触发**（带生效域名规则）
-- **页面内实时提示层** —— 鼠标轨迹、点击涟漪、拖拽连线、按键胶囊，录制和回放时都显示
-- **健壮的元素定位** —— `data-testid` → 稳定 id → name → aria → placeholder → CSS 路径。**坐标永远不作为定位依据**
-- **支持 iframe** —— 跨 frame 录制与回放
-- **失败一定看得见** —— 所有错误都会显示在 popup 上，不存在静默无响应
-
----
+- **事件组编排** —— 一条任务由若干事件串成，每个事件可以是录制的手势，也可以是一段自定义 JS，两者随便混排
+- **每个事件可设进入条件** —— 等地址变成某个样子、等某个元素出现，都等不到就跳过这一个，后面的照常跑
+- **步骤级匹配条件** —— 给某个点击补一条 `.green[href]` 这样的 CSS 约束，页面出现同名元素时不会点错
+- **Debug 执行日志** —— 打开后逐步记录，独立页面按任务/级别过滤、导出 JSON
+- **Google Drive 云备份** —— 任务与设置一键备份到自己的 Drive，换台机器直接恢复
+- **两种回放引擎** —— 合成 DOM 事件（`isTrusted=false`）与 CDP 真实输入（`isTrusted=true`）
+- **页面内实时提示** —— 鼠标轨迹、点击涟漪、拖拽连线、按键与输入回显，录制和回放时都有
+- **健壮的元素定位** —— `data-testid` > id > name > aria > placeholder > CSS 路径；坐标永远不作为定位依据
+- **拖拽录制与回放** —— 路径以「相对起点的偏移」保存，布局小幅变化也能落对位置
+- **页面加载触发** —— 生效域名、延迟、等元素、等前台、冷却、同一次加载只触发一次
+- **iframe 感知**，秒级定时由 offscreen 文档驱动
 
 ## 安装
 
@@ -100,6 +102,71 @@ Windows 版 Edge 会拦截非商店来源的 .crx 安装 —— 微软已公开�
 | **补一步等待** | 步骤列表底部「＋ 插入等待」，用于给动态页面留时间 |
 | **导出 / 导入** | 单条在卡片里「导出此脚本」；全部在 **设置 → 备份与恢复** |
 
+### 事件组与自定义 JS
+
+一条任务不再只是「一串手势」，而是**事件组**：若干事件按顺序串起来执行。
+
+| 事件类型 | 内容 |
+|---|---|
+| **手势** | 一段录制下来的点击 / 输入 / 拖拽步骤 |
+| **JS** | 一段自定义 JavaScript（类 Tampermonkey） |
+
+两种可以混排。典型用法：手势事件负责点开页面 → JS 事件从页面上抓数或计算 → 手势事件把结果填进另一个表单。
+
+**每个事件都可以配自己的进入条件**（执行它之前先等）：
+
+| 条件 | 说明 |
+|---|---|
+| **地址匹配** | 等页面跳到匹配的地址再执行。写法与「生效域名」相同：`/detail`、`detail.example.com`、`https://a.com/x` |
+| **等元素** | 等这个 CSS 选择器出现再执行，比固定延迟可靠得多 |
+| **超时** | 上面两个条件的等待上限（秒） |
+
+等不到只跳过这一个事件，**后面的照常执行** —— 「页面这次渲染慢了」不该连累整条流程。跳过的原因会显示在运行结果里。
+
+#### JS 事件
+
+代码在**页面主世界**执行，所以能访问页面自己的变量（jQuery、React 实例等）。可用的桥接对象是 `gp`：
+
+| 用法 | 说明 |
+|---|---|
+| `gp.$(sel)` / `gp.$$(sel)` | 查单个 / 查全部元素 |
+| `gp.waitFor(sel, ms)` | 等元素出现，超时返回 `null` |
+| `gp.sleep(ms)` | 等待 |
+| `gp.log(...)` | 写进执行日志 |
+| `gp.url` / `gp.title` / `gp.task` | 当前地址 / 标题 / 任务名 |
+
+可以直接写 `await`，也可以用 `return` 交回一个值（会记进日志，方便确认到底抓到了什么）。
+
+```js
+// 把列表页的订单号抓出来
+const rows = gp.$$('.order-row');
+gp.log('共', rows.length, '行');
+return rows.map((r) => r.dataset.orderId);
+```
+
+**执行方式有两条路**：默认先试轻量注入（快，页面上不留痕迹）；站点 CSP 若禁止 `eval`，会自动改用调试接口重试（页面顶部会出现「正在调试此浏览器」提示条）。日志里会写明这次实际走的是哪条。也可以在事件上强制「总是用调试接口」。
+
+在 popup 里点「编辑代码」会打开一个独立页面 —— popup 只有 420px 宽，写几行就看不见全貌了。
+
+> 代码由你自己提供并在页面里执行，扩展不做沙箱限制，请只跑你信任的代码。
+
+#### 步骤匹配条件
+
+录制出来的定位器是自动挑的。页面上一旦出现同名按钮、或者列表里结构一样的行，就可能点错。
+
+每个步骤都能补一条**额外匹配条件**（CSS 选择器），目标元素必须同时满足它才算找到：
+
+| 条件 | 含义 |
+|---|---|
+| `.green` | class 里有 `green` |
+| `[href]` | 必须有 `href` 属性 |
+| `a.green[href^="/detail"]` | 几个条件叠加 |
+| `:not(.disabled)` | 排除禁用态 |
+
+点步骤行右侧的 **＋⌕** 就能加。录制时顺手记下了目标元素的 class 和属性，所以界面会列出可点的快捷 chip —— 点一下 `.green` 就拼好了，不用回页面开 DevTools 抄选择器。
+
+条件不满足时按「没找到」处理，于是**会继续等**而不是点到错的元素。选择器写错了会立刻报出来，而不是表现成「元素找不到」让你去怀疑页面改版。
+
 ### 快捷键与右键菜单
 
 不想每次去点扩展图标的话：
@@ -125,6 +192,31 @@ Windows 版 Edge 会拦截非商店来源的 .crx 安装 —— 微软已公开�
 
 导入是「补充」语义，所以可以反复导入同一份备份而不会产生重复，也不会误删现有配置。
 
+### 云备份（Google Drive）
+
+本地导出适合临时搬运，跨设备就麻烦了。云备份把任务存到你自己的 Google Drive。
+
+**需要你先建一个 OAuth 客户端**（一次性，免费）：
+
+1. 去 [Google Cloud Console](https://console.cloud.google.com/) 建一个项目
+2. 启用 **Google Drive API**
+3. 「凭据」→ 建 **OAuth 客户端 ID**，类型选 **Web 应用**
+4. 把扩展设置页里显示的**重定向 URI**（形如 `https://<你的扩展ID>.chromiumapp.org/`）填进它的「已获授权的重定向 URI」
+5. 把拿到的 Client ID 粘回扩展设置页，点「连接 Google Drive」
+
+为什么不内置一个 Client ID：开源仓库里放不了客户端凭据，而且重定向地址必须跟着扩展 ID 变。填一次就能一直用。
+
+| 按钮 | 作用 |
+|---|---|
+| **连接 Google Drive** | 走 OAuth2 + PKCE 授权，refresh token 存在本地，之后免登录 |
+| **立即备份** | 把所有任务和设置打包上传，**自动只保留最近 20 份** |
+| **云端备份** | 列出云端文件，每条都带「恢复」 |
+| **断开** | 只清本地令牌，云端文件不动 |
+
+备份存在 Drive 上一个叫 **Gesture Pilot Backups** 的文件夹里，你能自己看见、自己下载、自己删。用的 scope 是 `drive.file` —— **只能看到本应用创建的文件**，读不到你 Drive 里其他任何东西。
+
+恢复是「补充」语义：同 id 的任务跳过，不覆盖你现在的配置，所以反复恢复同一份备份也不会出问题。备份文件的格式和本地导出完全一致，两边可以互相搬。
+
 ### 回放引擎
 
 | | 合成事件（默认） | CDP 真实输入 |
@@ -140,6 +232,20 @@ Windows 版 Edge 会拦截非商店来源的 .crx 安装 —— 微软已公开�
 可以在 **设置** 里设全局默认，也可以在单个脚本里覆盖（脚本设置优先）。
 
 ---
+
+## Debug：执行日志
+
+出问题时最想知道的是「它跑到哪一步、卡在哪」。打开 **设置 → Debug** 之后会记录：
+
+- 任务开始 / 结束、目标页面、生效引擎、触发来源
+- 每个事件的进入条件是否满足；等不到元素时等的是哪个选择器
+- 每一步的类型、延时、实际耗时
+- JS 事件走的哪条执行路径、返回值是什么、`console.log` 打出来的内容
+- 失败时具体是哪个事件、哪一步
+
+**设置 → 打开日志查看器**进入独立页面：按任务 / 级别过滤、搜关键词、清空、导出 JSON。
+
+日志存在本地（`storage.local`），按「条数上限」滚动丢弃最旧的（默认 1000 条）。关掉 Debug 时埋点在第一步就返回，开销可以忽略 —— 所以不必一直开着，出问题再打开就行。
 
 ## 页面内实时提示
 
@@ -184,7 +290,7 @@ Windows 版 Edge 会拦截非商店来源的 .crx 安装 —— 微软已公开�
 | **加载后等 N 秒** | 页面加载后先等一会儿再动，给 SPA 渲染留时间 |
 | **等元素** | 填 CSS 选择器。非空时会先等这个元素出现，**等不到就不触发**（比固定延迟可靠得多） |
 | **等标签页切到前台** | 勾上后，后台标签页不会触发，等你切过去再动 |
-| **冷却 N 秒** | 只防「页面或脚本自己跳转造成的连环触发」。**你按 F5 / 重新输入地址 / 点书签过来时不受它限制** |
+| **冷却 N 秒** | 两次**自动**触发之间的最小间隔 —— 页面加载、刷新、定时都算。**手动点「运行」不受它限制** |
 | **同一次页面加载只触发一次** | 默认开启。按「页面加载」计数，刷新页面算新的一次 |
 
 ### 生效域名的写法
@@ -202,21 +308,21 @@ Windows 版 Edge 会拦截非商店来源的 .crx 安装 —— 微软已公开�
 
 ### 触发是怎么保证不失控的
 
-脚本跑起来可能会导航到别的页面，而导航又会再次满足触发条件 —— 处理不当就是死循环。三道闸门：
+任务跑起来可能会导航到别的页面，而导航又会再次满足触发条件 —— 处理不当就是死循环。三道闸门：
 
 1. **同一次页面加载只触发一次**（内容脚本每次加载生成一个 `loadId`，后台记住已触发的那个）
-2. **冷却** —— 只对「页面或脚本自己跳转过来」的加载生效
-3. **已有脚本在运行时，新的触发直接跳过**，不让两个自动化互相踩
+2. **冷却** —— 对所有**自动**路径生效：页面加载、刷新、定时
+3. **已有任务在运行时，新的触发直接跳过**，不让两个自动化互相踩
 
-**用户主动导航是被豁免的。** 后台监听 `chrome.webNavigation.onCommitted`，看这次加载的 `transitionType`：`reload`（F5）、`typed`（地址栏重新输入）、`auto_bookmark`（点书签）、`generated` 都算用户新的一次意图，直接放行。
+**只有手动执行豁免冷却。** 点「运行」按钮或按 `Ctrl+Shift+K` 是明确的意图，不该被防重复的闸门挡着。
 
-没有这条豁免就会出现「脚本跑过一次之后，怎么刷新都不再触发」—— 那正是 0.5.1 修掉的问题。反过来，脚本点链接跳过来的（`link`）、表单提交（`form_submit`）仍然受冷却限制，所以脚本自己造成的回环依然拦得住。
+> v0.5.1 曾经让「用户按 F5 刷新」绕过冷却，结果变成「怎么刷都触发」，比原来的问题更难预期。0.6.0 改回来了：自动就是自动，手动才是手动。
+
+导航来源（`chrome.webNavigation.onCommitted` 的 `transitionType`）仍然会被记下来，写在日志和触发记录里，方便回头查「这次到底是刷新来的还是页面自己跳的」。
 
 这三件事都放在 service worker 侧：内容脚本每次页面加载都是全新实例，记不住「刚刚已经跑过」，而它们恰恰需要跨页面加载的记忆。
 
 跳过原因除了打到页面控制台（前缀 `[Gesture Pilot]`），**也会直接显示在 popup 的触发区**：「上次被跳过：冷却中，还要等 8 秒……」。不用开控制台猜。
-
----
 
 ## 拖拽
 
@@ -303,95 +409,110 @@ MV3 的 service worker 空闲约 **30 秒**就被回收。而录制期间的真�
 
 ## 测试
 
-沙箱里开不了浏览器，所以配了三套 Node 冒烟测试，用伪造的 `chrome.*` API 和 DOM 垫片把代码**真正执行**一遍。运行：
-
 ```bash
-node tools/mock-harness.mjs      # Service Worker：录制/调度/回放/CDP/拖拽/offscreen/触发/菜单/快捷键/导入（103 项）
-node tools/content-harness.mjs   # 内容脚本：加载、HUD 绘制与回显、拖拽录放、域名规则、触发行为（138 项）
-node tools/popup-harness.mjs     # popup：加载、事件绑定、错误可见、版本自检、改名、步骤编辑、备份恢复（66 项）
+node tools/mock-harness.mjs      # Service Worker：录制/调度/回放/CDP/拖拽/事件组/JS 执行/触发/日志/云备份（149 项）
+node tools/content-harness.mjs   # 内容脚本：加载、HUD、拖拽录放、域名规则、触发行为、匹配条件（157 项）
+node tools/popup-harness.mjs     # popup：加载、绑定、错误可见、版本自检、事件组编辑、备份恢复（82 项）
 ```
 
-这些测试抓的是 `node --check` 抓不到的问题：未定义引用、字段拼错、状态机走空、错误被静默吞掉。
+这些测试用伪造的 `chrome.*` API 和 DOM 垫片把代码**真的跑起来**，抓的是 `node --check` 抓不到的问题：未定义引用、字段拼错、状态机走空、错误被静默吞掉、CSP 降级路径走不通。
 
 已经靠它抓到并修掉的真实缺陷：
 
 - `broadcast()` 被调用但从未定义（点了没反应）
 - `SCRIPT_UPDATE` 漏调 `syncAlarms()`，改成秒级周期不生效
-- 录制状态放在 SW 模块变量里，SW 被回收后步骤全丢（录制成功但一步都没有）
+- 录制状态放在 SW 模块变量里，SW 被回收后步骤全丢
 - `flushInput` 拿「初始值」比对，导致只敲一个字符的输入整条被丢弃
-- `runStep` 对没有 locator 的 `key` 步骤仍去等元素，白等 8 秒后失败（页面级快捷键走不通）
-- HUD 里合成出来的修饰键没有 keyup，会在页面底部无限累积
-- 合成事件用了顶层视口坐标而不是本 frame 坐标，iframe 里的点击 `clientX` 会偏
-- 指针停住后 HUD 仍以 60fps 空转重绘（长时间录制白耗电）
-
-v0.5.1 新增：用户刷新 / 重新输入地址 / 点书签可以绕过冷却重新触发，脚本点链接跳过来的仍被拦住（防止脚本自己触发自己），子 frame 的导航不污染顶层判定，跳过原因直接显示在界面上。
-
-v0.5.0 新增的回归覆盖：定时生效域名守卫、脚本停用后不建 alarm 也不响应触发、老脚本读取时自动补全结构、导入的去重与坏数据兜底、右键菜单与快捷键、改名提交、步骤上移/下移/复制/删除/延时编辑。
-
-域名匹配有一份可复用逻辑（`lib/domains.js`）和一份内容脚本内的实现（`content/trigger.js`，内容脚本不能用 `import`）。
-`tools/content-harness.mjs` 里有 23 组用例把两者**对拍**，保证不会走出分歧。
-
----
+- 指针停住后 HUD 仍以 60fps 空转重绘
+- 合成事件用了顶层视口坐标而不是本 frame 坐标，iframe 里 `clientX` 会偏
+- `runStep` 对没有 locator 的 key 步骤仍去等元素，白等 8 秒后失败
 
 ## 目录结构
 
 ```
-manifest.json              MV3 清单
-background.js              Service Worker：消息路由 / 调度 / 回放编排
-lib/storage.js             脚本 CRUD、设置、运行状态、触发默认值
+lib/storage.js             任务 / 事件 CRUD、设置、运行状态、结构规范化
+lib/logger.js              执行日志（环形缓冲，debug 打开时才写）
+lib/jsruntime.js           自定义 JS 的执行（轻量注入 + CSP 拦下时降级 CDP）
+lib/drive.js               Google Drive 云备份（OAuth2 + PKCE、上传 / 列表 / 下载）
+lib/domains.js             生效域名匹配（popup 与界面共用）
 lib/cdp.js                 CDP 引擎（chrome.debugger 封装）
-lib/domains.js             生效域名匹配（popup 共用；trigger.js 里有一份等价实现）
-content/selector.js        元素定位 + 坐标换算 + 受控组件写入（注入所有 frame）
+content/selector.js        元素定位 + 坐标换算 + 受控组件写入 + 匹配条件校验（静态注入所有 frame）
 content/hud.js             页面内实时提示层（鼠标轨迹 / 点击涟漪 / 按键胶囊）
-content/recorder.js        录制器（注入所有 frame）
+content/recorder.js        录制器（静态注入所有 frame）
 content/replayer.js        合成事件回放（按需注入）
 content/trigger.js         页面加载触发引擎（只注入顶层 frame，document_idle）
 offscreen/                 秒级定时器宿主
-popup/                     界面
-icons/                     build-extension.py 生成（icon* = 正常，rec* = 录制中）
-tools/                     Node 冒烟测试
-build-extension.py         图标生成、校验、打包
+popup/                     主界面
+editor/                    JS 事件的代码编辑器（独立页面）
+logs/                      执行日志查看器（独立页面）
 ```
-
----
 
 ## 脚本数据结构
 
-```jsonc
+```
 {
-  "id": "s_lx8f3a",
-  "name": "订单后台 · 10-09 14:52",
-  "targetUrl": "https://example.com/orders",
+  "id": "s_m1x2y3",
+  "name": "订单核对 · 10-12 09:30",
   "enabled": true,                   // 总开关：false = 定时与页面触发都停，手动仍可跑
+  "targetUrl": "https://example.com/orders",
   "engine": null,                    // null = 跟随全局设置
-  "schedule": {
+  "createdAt": 1791000000000,
+
+  "events": [                        // 事件组：按顺序串行执行
+    {
+      "id": "e_a1",
+      "name": "打开详情",
+      "type": "gesture",             // gesture | js
+      "enabled": true,
+      "wait": {                      // 执行这个事件之前先等
+        "url": "",                   // 地址匹配，留空 = 不管
+        "selector": "",              // 等元素出现，留空 = 不等
+        "timeoutSec": 20
+      },
+      "steps": [
+        {
+          "type": "click",
+          "locator": { "kind": "attr", "attr": "data-testid", "value": "row-1", "tag": "tr" },
+          "rel": { "x": 0.51, "y": 0.48 },
+          "match": ".green",         // 额外匹配条件（可选）：必须同时满足才算找到
+          "el": { "tag": "tr", "cls": ["green"], "attrs": [{ "name": "data-testid", "value": "row-1" }] },
+          "delay": 0
+        }
+      ]
+    },
+    {
+      "id": "e_b2",
+      "name": "抓订单号",
+      "type": "js",
+      "enabled": true,
+      "wait": { "url": "/orders", "selector": ".order-row", "timeoutSec": 20 },
+      "code": "return gp.$$('.order-row').length;",
+      "world": "auto"                // auto = 先注入再降级；cdp = 总是走调试接口
+    }
+  ],
+
+  "trigger": {                       // 页面加载触发
     "enabled": true,
-    "mode": "interval",              // interval | daily
-    "everySec": 1800,                // < 60 走 offscreen，>= 60 走 alarms
-    "time": "09:30",                 // daily 模式使用
-    "domains": ["example.com"]       // 生效域名：留空 = 不限
-  },
-  "trigger": {
-    "enabled": true,
-    "domains": ["example.com", "*.internal.test"],
+    "domains": ["example.com"],
     "delaySec": 3,
     "readySelector": "#app-ready",
     "readyTimeoutSec": 20,
     "requireVisible": false,
     "once": true,
-    "cooldownSec": 10
+    "cooldownSec": 10                // 所有自动路径共用；手动运行豁免
   },
-  "steps": [
-    { "type": "click",  "locator": {}, "rel": { "x": 0.51, "y": 0.48 }, "delay": 0 },
-    { "type": "input",  "locator": {}, "value": "ORD-2026", "delay": 1240 },
-    { "type": "select", "locator": {}, "value": "SHIPPED",  "delay": 620 },
-    { "type": "key",    "locator": {}, "key": { "key": "Enter", "code": "Enter", "vk": 13 }, "delay": 300 },
-    { "type": "wheel",  "deltaY": 900, "delay": 800 },
-    { "type": "drag",   "locator": {}, "rel": { "x": 0.1, "y": 0.5 },
-      "path": [{ "x": 0, "y": 0 }, { "x": 60, "y": 10 }, { "x": 150, "y": 0 }], "delay": 200 }
-  ]
+
+  "schedule": {                      // 定时
+    "enabled": false,
+    "mode": "interval",              // interval | daily
+    "everySec": 1800,                // < 60 走 offscreen，>= 60 走 alarms
+    "time": "09:30",
+    "domains": []
+  }
 }
 ```
+
+> 老版本的任务只有扁平的 `steps`，没有 `events`。读取时会自动包成一个手势事件，不需要任何迁移操作，界面和后台也不用写兼容分支。
 
 ### 定位器分级
 

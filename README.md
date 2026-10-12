@@ -10,15 +10,17 @@ A Manifest V3 extension for Microsoft Edge and Chromium browsers, built for auto
 
 ## Features
 
-- **Record once, replay forever** — captures clicks, typing, selects, key presses, scrolling and **drags**
-- **Two replay engines** — synthetic events (lightweight, no extra prompts) or real CDP input via `chrome.debugger` (`isTrusted === true`)
-- **Three ways to fire** — manual, timer (`chrome.alarms` / offscreen), or **page-load triggers** with domain rules
-- **Live on-page HUD** — mouse trail, click ripples, drag lines, keystroke pills, all while recording *and* replaying
-- **Robust element locators** — `data-testid` → stable id → name → aria → placeholder → CSS path. Coordinates are *never* used for targeting
-- **iframe aware** — records and replays across frames
-- **Fails loudly** — every error surfaces in the popup; no silent no-ops
-
----
+- **Event groups** — a task is a chain of events; each one is either a recorded gesture or a piece of custom JS, freely mixed
+- **Per-event entry conditions** — wait for a URL, wait for an element; failing skips just that event and the rest keep going
+- **Per-step match conditions** — constrain a click with something like `.green[href]` so a same-named element elsewhere doesn't get hit
+- **Debug execution log** — step-by-step records in a standalone viewer with filtering and JSON export
+- **Google Drive backup** — tasks and settings into your own Drive, restorable on another machine
+- **Two replay engines** — synthetic DOM events (`isTrusted=false`) and real CDP input (`isTrusted=true`)
+- **Live in-page HUD** — mouse trail, click ripples, drag lines, keystroke and input echo, during both recording and replay
+- **Robust locators** — `data-testid` > id > name > aria > placeholder > CSS path; coordinates are never used for targeting
+- **Drag recording and replay** — paths stored as offsets from the start point, so small layout shifts still land right
+- **Page-load triggers** — allowed domains, delay, wait-for-element, wait-for-focus, cooldown, once per load
+- **iframe aware**, with sub-minute scheduling driven by an offscreen document
 
 ## Install
 
@@ -100,6 +102,71 @@ Expand a script card and tick **Run on a schedule**:
 | **Add a wait** | "＋ Insert wait" at the bottom of the step list, for slow-rendering pages |
 | **Export / import** | Per script via "Export this script"; everything via **Settings → Backup & restore** |
 
+### Event groups and custom JS
+
+A task is no longer "a list of gestures" but an **event group**: several events chained in order.
+
+| Event type | What it holds |
+|---|---|
+| **Gesture** | A recorded run of clicks / typing / drags |
+| **JS** | A piece of JavaScript (Tampermonkey-style) |
+
+The two mix freely. A typical flow: a gesture event opens the page → a JS event scrapes or computes something → another gesture event types the result into a different form.
+
+**Every event can have its own entry condition** (checked before that event runs):
+
+| Condition | Meaning |
+|---|---|
+| **URL match** | Wait until the page navigates somewhere matching. Same syntax as allowed domains: `/detail`, `detail.example.com`, `https://a.com/x` |
+| **Wait for element** | Wait until this CSS selector shows up — far more reliable than a fixed delay |
+| **Timeout** | Upper bound in seconds for the two conditions above |
+
+Failing to reach a condition skips **only that event**; the rest still run. "The page happened to render slowly this time" should not take down the whole flow. Skipped events are reported in the run result.
+
+#### JS events
+
+Code runs in the **page's main world**, so it can reach the page's own variables (jQuery, React instances, …). The bridge object is `gp`:
+
+| Usage | Meaning |
+|---|---|
+| `gp.$(sel)` / `gp.$$(sel)` | Query one / all elements |
+| `gp.waitFor(sel, ms)` | Wait for an element, returns `null` on timeout |
+| `gp.sleep(ms)` | Wait |
+| `gp.log(...)` | Write to the execution log |
+| `gp.url` / `gp.title` / `gp.task` | Current URL / title / task name |
+
+`await` works at the top level, and `return` hands a value back (it lands in the log, which is usually how you confirm what a scraper actually found).
+
+```js
+// Pull the order ids off a list page
+const rows = gp.$$('.order-row');
+gp.log('rows:', rows.length);
+return rows.map((r) => r.dataset.orderId);
+```
+
+**There are two execution paths.** By default it tries a lightweight injection first (fast, leaves no trace on the page). If the site's CSP forbids `eval`, it automatically falls back to the debugger interface and retries — that one shows the "being debugged" bar at the top of the page. The log records which path was actually used. You can also pin an event to "always use the debugger interface".
+
+"Edit code" in the popup opens a separate page: the popup is 420px wide, and a few lines is all you can see.
+
+> The code is yours and it runs unsandboxed in the page. Only run code you trust.
+
+#### Per-step match conditions
+
+The locator is picked automatically at record time. The moment a page has two buttons with the same label — or a list where every row looks alike — it can hit the wrong one.
+
+Any step can carry an **extra match condition** (a CSS selector). The target element has to satisfy it too, or it does not count as found:
+
+| Condition | Meaning |
+|---|---|
+| `.green` | Has the class `green` |
+| `[href]` | Has an `href` attribute |
+| `a.green[href^="/detail"]` | Several conditions at once |
+| `:not(.disabled)` | Excludes disabled state |
+
+Click **＋⌕** on a step to add one. Recording also stashes the target's classes and attributes, so the UI offers clickable chips — one tap builds `.green` for you instead of sending you back to DevTools to copy a selector by hand.
+
+When the condition does not hold the step is treated as "not found yet", so it **keeps waiting** rather than clicking the wrong element. A malformed selector is reported immediately, rather than showing up as "element not found" and sending you off to suspect the page.
+
 ### Keyboard shortcuts and context menu
 
 For when you'd rather not go hunting for the toolbar icon:
@@ -125,6 +192,31 @@ Under **Settings → Backup & restore**:
 
 Import is additive by design, so re-importing the same backup is idempotent and can't clobber your existing setup.
 
+### Cloud backup (Google Drive)
+
+Local export is fine for moving things around once; across machines it gets tedious. Cloud backup keeps your tasks in your own Google Drive.
+
+**You need to create an OAuth client first** (one time, free):
+
+1. Create a project in the [Google Cloud Console](https://console.cloud.google.com/)
+2. Enable the **Google Drive API**
+3. Credentials → create an **OAuth client ID**, type **Web application**
+4. Paste the **redirect URI** shown in the extension's settings (looks like `https://<your-extension-id>.chromiumapp.org/`) into its "Authorized redirect URIs"
+5. Paste the resulting Client ID back into the extension and hit "Connect Google Drive"
+
+Why not ship a built-in Client ID: an open repository cannot hold client credentials, and the redirect address has to change with the extension ID. Enter it once and it keeps working.
+
+| Button | What it does |
+|---|---|
+| **Connect Google Drive** | OAuth2 + PKCE; the refresh token is stored locally so you stay signed in |
+| **Back up now** | Uploads every task and your settings, **keeping only the newest 20** |
+| **Cloud backups** | Lists the files, each with a "Restore" button |
+| **Disconnect** | Clears the local token only; cloud files are untouched |
+
+Backups land in a Drive folder named **Gesture Pilot Backups** — visible to you, downloadable, deletable. The scope is `drive.file`, so the extension **only ever sees files it created itself** and nothing else in your Drive.
+
+Restore is additive: tasks with an id that already exists are skipped, never overwritten, so restoring the same backup twice is harmless. The backup format is identical to the local export — the two are interchangeable.
+
 ### Replay engines
 
 | | Synthetic (default) | CDP real input |
@@ -140,6 +232,20 @@ Import is additive by design, so re-importing the same backup is idempotent and 
 Set the global default in **Settings**, or override per script (the script wins).
 
 ---
+
+## Debug: the execution log
+
+When something goes wrong the question is always "how far did it get, and where did it stop". Turn on **Settings → Debug** and it records:
+
+- task start / finish, target page, engine in use, what triggered it
+- whether each event's entry condition was met, and which selector it was waiting on when it wasn't
+- every step's type, delay and actual elapsed time
+- which execution path a JS event took, what it returned, and anything it sent to `console.log`
+- on failure, the exact event and step index
+
+**Settings → Open log viewer** opens a standalone page: filter by task or level, search, clear, export as JSON.
+
+Logs live locally (`storage.local`) in a rolling buffer that drops the oldest entries past the limit (1000 by default). With Debug off, every instrumentation point returns on the first line, so the overhead is negligible — leave it off and switch it on when you need it.
 
 ## In-page live HUD
 
@@ -186,7 +292,7 @@ Besides timers, a script can **run automatically when a matching page loads**. C
 | **Wait N seconds after load** | Delay before acting, giving SPAs time to render |
 | **Wait for element** | A CSS selector. When set, the script waits for it and **gives up if it never appears** — far more reliable than a fixed delay |
 | **Wait until tab is focused** | Background tabs won't trigger until you switch to them |
-| **Cooldown (seconds)** | Guards only against navigation the page causes **itself**. It **does not** apply when you press F5, retype the address or open a bookmark |
+| **Cooldown (seconds)** | Minimum gap between two **automatic** firings — page load, refresh and scheduled runs all count. **A manual run ignores it** |
 | **Only once per page load** | On by default. Counted per page load, so a refresh counts as a new one |
 
 ### Domain patterns
@@ -204,21 +310,21 @@ While a card is expanded the UI shows **"current page matches / doesn't match"**
 
 ### How triggers stay under control
 
-A script may navigate, and navigation re-satisfies the trigger condition — done naively that's an infinite loop. Three gates:
+A task may navigate, and navigation re-satisfies the trigger condition — done naively that is an infinite loop. Three gates:
 
 1. **Once per page load** — each content-script instance generates a `loadId`; the background remembers which one already fired
-2. **Cooldown** — applies only to page loads the page itself caused
-3. **Skip while another script is running**, so two automations never fight over the same page
+2. **Cooldown** — applies to every **automatic** path: page load, refresh, scheduled runs
+3. **Skip while another task is running**, so two automations never fight over the same page
 
-**User-initiated navigation is exempt.** The background listens to `chrome.webNavigation.onCommitted` and inspects the load's `transitionType`: `reload` (F5), `typed` (address bar), `auto_bookmark` and `generated` all count as a fresh user intent and bypass the cooldown.
+**Only manual execution bypasses the cooldown.** Clicking "Run" or pressing `Ctrl+Shift+K` is an explicit intent and should not be blocked by a de-duplication gate.
 
-Without that exemption you get the classic *the script ran once and now refreshing never triggers it again* — which is exactly what 0.5.1 fixed. Conversely, navigation the page caused itself (`link`, `form_submit`) is still rate-limited, so a script cannot drive itself in circles.
+> v0.5.1 briefly exempted user-initiated reloads from the cooldown. That turned into "every refresh fires it", which is harder to reason about than the original problem, so 0.6.0 reverted it: automatic is automatic, manual is manual.
+
+The navigation source (`transitionType` from `chrome.webNavigation.onCommitted`) is still recorded in the log and the trigger record, so you can check afterwards whether a given load came from a refresh or from the page navigating itself.
 
 All three gates live in the service worker on purpose: a content script is a fresh instance on every page load and cannot remember "I just ran", yet these gates specifically need memory that spans page loads.
 
-Skip reasons go to the page console (prefixed with `[Gesture Pilot]`) **and are shown right in the popup's trigger section** — *last skipped: cooling down, 8s to go*. No need to open DevTools and guess.
-
----
+Skip reasons go to the page console (prefixed `[Gesture Pilot]`) **and are shown right in the popup's trigger section** — "last skipped: cooling down, 8s to go". No need to open DevTools and guess.
 
 ## Drag
 
@@ -304,94 +410,108 @@ So the current design is:
 
 ## Testing
 
-No browser is available in the sandbox, so the project ships three Node smoke-test suites that build fake `chrome.*` APIs and DOM shims, then **actually execute** the code.
-
 ```bash
-node tools/mock-harness.mjs      # Service worker: recording/scheduling/replay/CDP/drag/offscreen/triggers/menus/shortcuts/import (103)
-node tools/content-harness.mjs   # Content scripts: loading, HUD drawing & echo, drag record/replay, domain rules, trigger behaviour (138)
-node tools/popup-harness.mjs     # Popup: loading, event binding, error visibility, version self-check, rename, step editing, backup (66)
+node tools/mock-harness.mjs      # Service worker: recording/scheduling/replay/CDP/drag/event groups/JS/CSP fallback/triggers/logging/Drive (149)
+node tools/content-harness.mjs   # Content scripts: loading, HUD, drag record/replay, domain rules, trigger behaviour, match conditions (157)
+node tools/popup-harness.mjs     # Popup: loading, binding, error visibility, version self-check, event-group editing, backup (82)
 ```
 
-These catch what `node --check` cannot: undefined references, misspelled fields, state machines that fall through, and errors swallowed silently.
+The suites build fake `chrome.*` APIs and DOM shims and *actually execute* the code, catching the class of bug `node --check` misses: undefined references, misspelled fields, state machines walking off the end, errors swallowed silently, and CSP fallback paths that never run.
 
-Real defects found and fixed this way:
-
-- `broadcast()` called but never defined (clicking "Start recording" did nothing)
-- `SCRIPT_UPDATE` omitted `syncAlarms()`, so sub-minute schedules never took effect
-- Recording state in SW module variables — all steps lost after SW eviction ("recording succeeded but captured zero steps")
-- `flushInput` compared against a stale "initial value", discarding any single-character input
-- `runStep` waited for an element on `key` steps with no locator — page-level shortcuts stalled 8 s then failed
-- Synthesized modifier pills in the HUD had no keyup and accumulated forever at the bottom of the page
-- Synthetic events used top-level viewport coordinates instead of frame-local ones, shifting `clientX` inside iframes
-- The HUD kept redrawing at 60 fps after the pointer stopped, draining battery on long recordings
-
-Added in v0.5.1: user-initiated reloads, retyped addresses and bookmarks bypass the cooldown and fire again, script-driven link navigation is still blocked (so a script cannot trigger itself), subframe navigation does not pollute the top-level verdict, and skip reasons are surfaced in the UI.
-
-New regression coverage added in v0.5.0: the schedule domain guard, disabled scripts not arming alarms or answering triggers, legacy scripts having their structure completed on read, import deduplication and bad-data tolerance, the context menu and keyboard shortcuts, rename commits, and step reorder/duplicate/delete/delay editing.
-
-Domain matching exists twice — a reusable module (`lib/domains.js`) and an inlined copy (`content/trigger.js`, since content scripts can't `import`). `tools/content-harness.mjs` **cross-checks both against 23 shared cases** so they can't drift apart.
-
----
+Real defects found and fixed this way:/n/n- `broadcast()` called but never defined (pressing record did nothing)
+- `SCRIPT_UPDATE` forgot to call `syncAlarms()`, so sub-minute intervals never took effect
+- Recording state kept in a service-worker module variable, so eviction silently dropped every step
+- `flushInput` compared against a stale "initial value", discarding single-character input entirely
+- The HUD kept redrawing at 60 fps after the pointer stopped
+- Synthetic events used top-level viewport coordinates, so `clientX` was wrong inside iframes
+- `runStep` waited 8 seconds for a nonexistent element on locator-less key steps
 
 ## Project layout
 
 ```
-manifest.json              MV3 manifest
-background.js              Service worker: message routing, scheduling, replay orchestration
-lib/storage.js             Script CRUD, settings, run state, trigger defaults
+lib/storage.js             Task / event CRUD, settings, run state, structure normalisation
+lib/logger.js              Execution log (ring buffer, only written when debug is on)
+lib/jsruntime.js           Custom JS execution (lightweight injection, CDP fallback on CSP)
+lib/drive.js               Google Drive backup (OAuth2 + PKCE, upload / list / download)
+lib/domains.js             Allowed-domain matching (shared by popup and background)
 lib/cdp.js                 CDP engine (chrome.debugger wrapper)
-lib/domains.js             Domain matching (shared with the popup; trigger.js has an equivalent copy)
-content/selector.js        Element locators + coordinate maths + controlled-component writes (all frames)
-content/hud.js             In-page live overlay (trail / ripples / key pills)
-content/recorder.js        Recorder (all frames)
+content/selector.js        Locating, coordinate maths, controlled-component writes, match validation
+content/hud.js             In-page HUD (mouse trail / click ripples / keystroke pills)
+content/recorder.js        Recorder (statically injected into every frame)
 content/replayer.js        Synthetic-event replay (injected on demand)
 content/trigger.js         Page-load trigger engine (top frame only, document_idle)
-offscreen/                 Sub-minute timer host
-popup/                     UI
-icons/                     Generated by build-extension.py (icon* = idle, rec* = recording)
-tools/                     Node smoke-test harnesses
-build-extension.py         Icon generation, validation, packaging
+offscreen/                 Host for sub-minute timers
+popup/                     Main UI
+editor/                    Code editor for JS events (standalone page)
+logs/                      Execution log viewer (standalone page)
 ```
-
----
 
 ## Script data format
 
-```jsonc
+```
 {
-  "id": "s_lx8f3a",
-  "name": "Orders · 10-09 14:52",
-  "targetUrl": "https://example.com/orders",
+  "id": "s_m1x2y3",
+  "name": "Order check · 10-12 09:30",
   "enabled": true,                   // master switch: false stops timers and triggers, manual still runs
+  "targetUrl": "https://example.com/orders",
   "engine": null,                    // null = inherit the global setting
-  "schedule": {
+  "createdAt": 1791000000000,
+
+  "events": [                        // the event group, executed in order
+    {
+      "id": "e_a1",
+      "name": "Open detail",
+      "type": "gesture",             // gesture | js
+      "enabled": true,
+      "wait": {                      // entry conditions for this event
+        "url": "",                   // URL match; empty = don't care
+        "selector": "",              // wait for element; empty = don't wait
+        "timeoutSec": 20
+      },
+      "steps": [
+        {
+          "type": "click",
+          "locator": { "kind": "attr", "attr": "data-testid", "value": "row-1", "tag": "tr" },
+          "rel": { "x": 0.51, "y": 0.48 },
+          "match": ".green",         // extra match condition (optional)
+          "el": { "tag": "tr", "cls": ["green"], "attrs": [{ "name": "data-testid", "value": "row-1" }] },
+          "delay": 0
+        }
+      ]
+    },
+    {
+      "id": "e_b2",
+      "name": "Scrape order ids",
+      "type": "js",
+      "enabled": true,
+      "wait": { "url": "/orders", "selector": ".order-row", "timeoutSec": 20 },
+      "code": "return gp.$$('.order-row').length;",
+      "world": "auto"                // auto = try injection then fall back; cdp = always debugger
+    }
+  ],
+
+  "trigger": {                       // page-load trigger
     "enabled": true,
-    "mode": "interval",              // interval | daily
-    "everySec": 1800,                // < 60 goes to offscreen, >= 60 to alarms
-    "time": "09:30",                 // used by daily mode
-    "domains": ["example.com"]       // allowed domains for timed runs; empty = unrestricted
-  },
-  "trigger": {
-    "enabled": true,
-    "domains": ["example.com", "*.internal.test"],
+    "domains": ["example.com"],
     "delaySec": 3,
     "readySelector": "#app-ready",
     "readyTimeoutSec": 20,
     "requireVisible": false,
     "once": true,
-    "cooldownSec": 10
+    "cooldownSec": 10                // shared by every automatic path; manual runs are exempt
   },
-  "steps": [
-    { "type": "click",  "locator": {}, "rel": { "x": 0.51, "y": 0.48 }, "delay": 0 },
-    { "type": "input",  "locator": {}, "value": "ORD-2026", "delay": 1240 },
-    { "type": "select", "locator": {}, "value": "SHIPPED",  "delay": 620 },
-    { "type": "key",    "locator": {}, "key": { "key": "Enter", "code": "Enter", "vk": 13 }, "delay": 300 },
-    { "type": "wheel",  "deltaY": 900, "delay": 800 },
-    { "type": "drag",   "locator": {}, "rel": { "x": 0.1, "y": 0.5 },
-      "path": [{ "x": 0, "y": 0 }, { "x": 60, "y": 10 }, { "x": 150, "y": 0 }], "delay": 200 }
-  ]
+
+  "schedule": {                      // timed runs
+    "enabled": false,
+    "mode": "interval",              // interval | daily
+    "everySec": 1800,                // < 60 goes to offscreen, >= 60 to alarms
+    "time": "09:30",
+    "domains": []
+  }
 }
 ```
+
+> Tasks written by older versions only have a flat `steps` array and no `events`. On read they are wrapped into a single gesture event — no migration step, and neither the UI nor the background needs compatibility branches.
 
 ### Locator tiers
 

@@ -194,11 +194,23 @@
     }
   }
 
+  /** 报错时把人工加的匹配条件也带上，否则用户不知道是哪个条件没满足 */
+  function describeWithMatch(step) {
+    const base = GX.describeLocator(step.locator);
+    return step.match ? `${base} 且满足「${step.match}」` : base;
+  }
+
   /* ---------------- 单步执行 ---------------- */
 
   async function runStep(step, settings) {
     const timeout = settings?.stepTimeout ?? 8000;
     const humanize = settings?.humanize !== false;
+
+    // 匹配条件写错了必须立刻报出来。否则表现出来只是「元素找不到」，
+    // 而用户会去怀疑选择器、怀疑页面改版，很难想到是自己少打了个括号。
+    if (step.match && !GX.isValidSelector(step.match)) {
+      return { ok: false, error: `匹配条件「${step.match}」不是合法的 CSS 选择器` };
+    }
 
     if (step.type === 'wait') {
       await GX.sleep(Number(step.value) || 1000);
@@ -208,7 +220,7 @@
     if (step.type === 'wheel') {
       const dx = Number(step.deltaX) || 0;
       const dy = Number(step.deltaY) || 0;
-      const el = step.locator ? GX.resolve(document, step.locator) : null;
+      const el = step.locator ? GX.resolve(document, step.locator, step.match) : null;
       const target = el || document.scrollingElement || document.documentElement;
       // 分几次滚动，避免一次性大跳变（部分站点只监听多次 wheel）
       const parts = Math.min(6, Math.max(1, Math.round(Math.abs(dy) / 400)));
@@ -238,8 +250,8 @@
       return { ok: true };
     }
 
-    const el = await GX.waitFor(step.locator, timeout);
-    if (!el) return { ok: false, error: `元素未出现：${GX.describeLocator(step.locator)}` };
+    const el = await GX.waitFor(step.locator, timeout, null, step.match);
+    if (!el) return { ok: false, error: `元素未出现：${describeWithMatch(step)}` };
 
     switch (step.type) {
       case 'click':
@@ -264,7 +276,7 @@
 
       case 'key': {
         if (step.locator) {
-          const focusable = await GX.waitFor(step.locator, timeout);
+          const focusable = await GX.waitFor(step.locator, timeout, null, step.match);
           if (focusable && typeof focusable.focus === 'function') {
             focusable.focus({ preventScroll: true });
             await GX.sleep(50);
@@ -365,9 +377,9 @@
     if (msg.type === 'GX_RESOLVE_POINT') {
       (async () => {
         try {
-          const el = await GX.waitFor(msg.step.locator, msg.timeout ?? 8000);
+          const el = await GX.waitFor(msg.step.locator, msg.timeout ?? 8000, null, msg.step.match);
           if (!el) {
-            sendResponse({ ok: false, error: `元素未出现：${GX.describeLocator(msg.step.locator)}` });
+            sendResponse({ ok: false, error: `元素未出现：${describeWithMatch(msg.step)}` });
             return;
           }
           const point = GX.clientPointAt(el, msg.step.rel);

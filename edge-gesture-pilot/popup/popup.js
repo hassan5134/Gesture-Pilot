@@ -1,4 +1,7 @@
-import { DEFAULT_SETTINGS, normalizeTrigger, parseDomainText } from '../lib/storage.js';
+import {
+  DEFAULT_SETTINGS, normalizeTrigger, parseDomainText,
+  defaultEvent, countSteps,
+} from '../lib/storage.js';
 import { matchesDomain, describePatterns } from '../lib/domains.js';
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -33,6 +36,9 @@ const state = {
   renaming: null,    // 正在改名的脚本 id（列表里会切换成输入框）
   triggerLog: {},    // 每个脚本上次页面触发的时间
   activeUrl: '',     // 当前标签页 URL，用来实时提示「当前页面匹不匹配」
+  logStats: null,    // 日志条数 / 上限 / 开关状态
+  drive: null,       // Google Drive 连接状态
+  driveFiles: [],    // 云端备份列表
   open: new Set(),   // 展开的脚本 id
   poll: null,
 };
@@ -151,6 +157,14 @@ function exportFilename(prefix) {
   const d = new Date();
   const pad = (n) => String(n).padStart(2, '0');
   return `${prefix}-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.json`;
+}
+
+/** 没有录制快照时，给匹配条件一个起点，省得对着空白框发呆 */
+function suggestMatch(st) {
+  const h = st.el;
+  if (h?.cls?.length) return `.${h.cls[0]}`;
+  if (h?.attrs?.length) return `[${h.attrs[0].name}]`;
+  return '';
 }
 
 function locatorText(step) {
@@ -288,7 +302,7 @@ function renderList() {
       <div class="name" data-act="rename" title="点击改名">${title}</div>
       <div class="sub">
         <span class="${tagCls}">${off ? '已停用' : esc(scheduleText(sched))}</span>
-        ${s.steps.length} 步 · ${esc(hostOf(s.targetUrl))} · ${s.engine ? esc(s.engine) : '默认引擎'}
+        ${s.events.length} 个事件 · ${countSteps(s)} 步 · ${esc(hostOf(s.targetUrl))} · ${s.engine ? esc(s.engine) : '默认引擎'}
         ${trig ? ` · ${esc(trig)}` : ''}
         ${trig || off ? '' : (scheduleDomainsText(sched) ? ` · ${esc(scheduleDomainsText(sched))}` : '')}
       </div>
@@ -363,34 +377,149 @@ function triggerBlock(s) {
 }
 
 /** 单步编辑行：420px 宽度下用两行才排得开 */
-function stepRow(st, i, total) {
+const EVENT_KIND = { gesture: '手势', js: 'JS' };
+const NL = String.fromCharCode(10);
+
+/** 取第一行做摘要（JS 事件没起名时，用代码首行当标题） */
+function firstLine(s) {
+  const t = String(s || '').trim();
+  const i = t.search(/[\r\n]/);
+  return i >= 0 ? t.slice(0, i) : t;
+}
+
+/**
+ * 把录制时记下的 class / 属性拼成可点的快捷条件。
+ *
+ * 没有这个，用户要加「必须匹配 .green」就得自己回页面开 DevTools 抄选择器 ——
+ * 那这个功能基本不会有人用。所以录制时顺手存了一份元素特征。
+ */
+function matchChips(st) {
+  const h = st.el;
+  if (!h) return '';
+  const out = [];
+
+  for (const c of (h.cls || []).slice(0, 5)) {
+    out.push(
+      `<button class="chip" data-match-add=".${esc(c)}" title="要求同时带 class ${esc(c)}">.${esc(c)}</button>`,
+    );
+  }
+  for (const a of (h.attrs || []).slice(0, 6)) {
+    out.push(
+      `<button class="chip" data-match-add="[${esc(a.name)}]" title="${esc(a.name)} = ${esc(a.value)}">[${esc(a.name)}]</button>`,
+    );
+  }
+  if (!out.length) return '';
+  return `<span class="chips" title="点一下，加进匹配条件">${out.join('')}</span>`;
+}
+
+/** 单步编辑行：420px 宽度下用两行才排得开 */
+function stepRow(st, si, total, ei) {
   const kind = KIND[st.type] || st.type;
   const editable = st.type === 'input' || st.type === 'select' || st.type === 'wait';
   const val = st.type === 'wait' ? (st.value ?? 1000) : (st.value ?? '');
 
   const valueCell = editable
-    ? `<input class="val" type="text" data-step="${i}" value="${esc(val)}"
+    ? `<input class="val" type="text" data-step="${si}" data-ev="${ei}" value="${esc(val)}"
          placeholder="${st.type === 'wait' ? '毫秒' : '值'}" />`
     : `<span class="sel" title="${esc(stepDetail(st))}">${esc(stepDetail(st))}</span>`;
 
+  // 匹配条件：录制的定位器是自动挑的，页面出现同名元素时容易点错，靠它加固
+  const matchCell = st.match
+    ? `<input class="match" type="text" data-match="${si}" data-ev="${ei}" value="${esc(st.match)}"
+         title="必须同时满足这个 CSS 选择器，才算找到目标" />
+       <button class="mini" data-clear-match="${si}" data-ev="${ei}" title="去掉匹配条件">✕</button>`
+    : '';
+
   return `
-<div class="step">
+<div class="step" data-si="${si}" data-ei="${ei}">
   <div class="step-l1">
-    <span class="idx">${i + 1}</span>
+    <span class="idx">${si + 1}</span>
     <span class="kind ${st.type}">${kind}</span>
     <span class="sel" title="${esc(locatorText(st))}">${esc(locatorText(st))}</span>
+    <button class="mini" data-toggle-match="${si}" data-ev="${ei}"
+      title="${st.match ? '收起匹配条件' : '加匹配条件'}">${st.match ? '⊘' : '＋⌕'}</button>
   </div>
+  ${matchCell ? `<div class="step-l2 step-match">${matchCell}${matchChips(st)}</div>` : ''}
   <div class="step-l2">
     ${valueCell}
-    <span class="dly">延时<input type="number" min="0" step="50" data-delay="${i}"
+    <span class="dly">延时<input type="number" min="0" step="50" data-delay="${si}" data-ev="${ei}"
       value="${Math.max(0, Number(st.delay) || 0)}" />ms</span>
     <span class="ops">
-      <button data-up="${i}" title="上移" ${i === 0 ? 'disabled' : ''}>↑</button>
-      <button data-down="${i}" title="下移" ${i === total - 1 ? 'disabled' : ''}>↓</button>
-      <button data-dup="${i}" title="复制这一步">＋</button>
-      <button data-del="${i}" title="删除这一步">✕</button>
+      <button data-up="${si}" data-ev="${ei}" title="上移" ${si === 0 ? 'disabled' : ''}>↑</button>
+      <button data-down="${si}" data-ev="${ei}" title="下移" ${si === total - 1 ? 'disabled' : ''}>↓</button>
+      <button data-dup="${si}" data-ev="${ei}" title="复制这一步">＋</button>
+      <button data-del="${si}" data-ev="${ei}" title="删除这一步">✕</button>
     </span>
   </div>
+</div>`;
+}
+
+/**
+ * 一个事件。
+ *
+ * 手势事件展开成步骤列表；JS 事件展开成代码摘要加一个「编辑代码」按钮 ——
+ * popup 只有 420px 宽，正经写代码得挪到独立页面去。
+ */
+function eventBlock(ev, ei, total) {
+  const isJs = ev.type === 'js';
+  const src = String(ev.code || '');
+  const badge = `<span class="ev-kind ${isJs ? 'js' : 'gesture'}">${EVENT_KIND[ev.type] || ev.type}</span>`;
+  const ph = isJs ? 'JS 事件名（可留空）' : '手势事件名（可留空）';
+
+  const w = ev.wait || {};
+  let inner;
+
+  if (isJs) {
+    const lines = src ? src.split(NL).length : 0;
+    inner = `
+    <div class="ev-js">
+      <div class="ev-js-meta">
+        <span>${lines} 行 · ${src.length} 字符</span>
+        <span class="dim">${ev.world === 'cdp' ? '总是走调试接口' : '自动：先注入，被站点 CSP 拦下再切调试接口'}</span>
+      </div>
+      <pre class="ev-code">${esc(src.slice(0, 700))}${src.length > 700 ? ' …' : ''}</pre>
+      <div class="row">
+        <button class="btn" data-evd="edit-code" data-ev="${ei}">编辑代码</button>
+        <select data-evd="world" data-ev="${ei}" style="width:auto">
+          <option value="auto" ${ev.world === 'cdp' ? '' : 'selected'}>自动选执行方式</option>
+          <option value="cdp" ${ev.world === 'cdp' ? 'selected' : ''}>总是用调试接口</option>
+        </select>
+      </div>
+    </div>`;
+  } else {
+    const steps = (ev.steps || []).map((st, si) => stepRow(st, si, ev.steps.length, ei)).join('');
+    inner = `
+    <div class="steps">
+      ${steps || '<div class="step"><span class="dim">这个事件里没有步骤</span></div>'}
+      <div class="steps-foot">
+        <button class="btn" data-evd="add-wait" data-ev="${ei}">＋ 插入等待</button>
+        <span class="dim" style="margin-left:auto;align-self:center">${ev.steps?.length || 0} 步</span>
+      </div>
+    </div>`;
+  }
+
+  return `
+<div class="event" data-ei="${ei}">
+  <div class="ev-hd">
+    ${badge}
+    <input class="ev-name" type="text" data-evd="name" data-ev="${ei}" value="${esc(ev.name || '')}"
+      placeholder="${ph}" maxlength="60" />
+    <span class="ops">
+      <button data-evd="ev-up" data-ev="${ei}" title="上移" ${ei === 0 ? 'disabled' : ''}>↑</button>
+      <button data-evd="ev-down" data-ev="${ei}" title="下移" ${ei === total - 1 ? 'disabled' : ''}>↓</button>
+      <button data-evd="ev-del" data-ev="${ei}" title="删除这个事件">✕</button>
+    </span>
+  </div>
+  <div class="ev-wait">
+    <span class="dim">执行前等</span>
+    <input type="text" data-evd="wait-url" data-ev="${ei}" value="${esc(w.url || '')}"
+      placeholder="地址匹配（可留空，如 /detail 或 detail.example.com）" style="flex:1" />
+    <input type="text" data-evd="wait-selector" data-ev="${ei}" value="${esc(w.selector || '')}"
+      placeholder="等元素出现（CSS，可留空）" style="flex:1" />
+    <input type="number" min="1" data-evd="wait-timeout" data-ev="${ei}" value="${w.timeoutSec || 20}"
+      style="width:50px" title="等待超时（秒）" />
+  </div>
+  ${inner}
 </div>`;
 }
 
@@ -400,14 +529,13 @@ function cardBody(s) {
   const useSeconds = everySec < 60;
   const amount = useSeconds ? everySec : Math.round(everySec / 60);
   const daily = sch.mode === 'daily';
-
-  const steps = s.steps.map((st, i) => stepRow(st, i, s.steps.length)).join('');
+  const events = (s.events || []).map((ev, ei) => eventBlock(ev, ei, s.events.length)).join('');
 
   return `
 <div class="card-bd">
   <div class="field" style="margin-bottom:8px">
-    <label for="nm-${s.id}">脚本名称</label>
-    <input id="nm-${s.id}" type="text" data-name value="${esc(s.name)}" maxlength="80" placeholder="给脚本起个名字" />
+    <label for="nm-${s.id}">任务名称</label>
+    <input id="nm-${s.id}" type="text" data-name value="${esc(s.name)}" maxlength="80" placeholder="给任务起个名字" />
   </div>
 
   <div class="sched">
@@ -436,17 +564,21 @@ function cardBody(s) {
 
   ${triggerBlock(s)}
 
-  <div class="steps">
-    ${steps || '<div class="step"><span class="dim">没有步骤</span></div>'}
-    <div class="steps-foot">
-      <button class="btn" data-act="add-wait">＋ 插入等待</button>
-      <span class="dim" style="margin-left:auto;align-self:center">共 ${s.steps.length} 步</span>
+  <div class="ev-list">
+    <div class="ev-list-hd">
+      <span>事件组</span>
+      <span class="dim">按顺序执行</span>
+      <span style="margin-left:auto">
+        <button class="btn" data-act="add-gesture">＋ 手势</button>
+        <button class="btn" data-act="add-js">＋ JS</button>
+      </span>
     </div>
+    ${events || '<div class="dim" style="padding:10px 2px">还没有事件。点上面的「＋ 手势」加一段录制的操作，或「＋ JS」写代码。</div>'}
   </div>
 
   <div class="row" style="margin:8px 0 0">
     <button class="btn" data-act="copy">复制 JSON</button>
-    <button class="btn" data-act="export">导出此脚本</button>
+    <button class="btn" data-act="export">导出此任务</button>
     <button class="btn" data-act="dup">创建副本</button>
     <button class="btn" data-act="run" ${state.run?.status === 'running' ? 'disabled' : ''}>立即运行</button>
   </div>
@@ -454,6 +586,16 @@ function cardBody(s) {
 }
 
 function renderSettings() {
+  const ls = state.logStats;
+  const box = $('#logStat');
+  if (box) {
+    box.textContent = ls
+      ? `${ls.count} 条${ls.limit ? ` / 上限 ${ls.limit}` : ''}`
+      : '';
+  }
+
+  renderDrive();
+
   for (const el of $$('[data-set]')) {
     const key = el.dataset.set;
     const v = state.settings[key];
@@ -471,6 +613,7 @@ async function refresh() {
     state.settings = { ...DEFAULT_SETTINGS, ...(r.settings || {}) };
     state.run = r.run || null;
     state.triggerLog = r.triggerLog || {};
+    state.logStats = r.logStats || null;
     // 老版本的后台不会带 version 字段 —— 这本身就是「该重新加载」的证据
     state.bgVersion = r.version ?? null;
     state.stale = state.bgVersion !== LOCAL_VERSION;
@@ -485,6 +628,13 @@ async function refresh() {
 
   const rec = await api({ type: 'RECORD_STATE' });
   state.recording = rec?.recording || null;
+
+  try {
+    const drv = await api({ type: 'DRIVE_STATUS' });
+    if (drv?.ok) state.drive = drv.drive;
+  } catch {
+    /* 云备份不可用不该影响其它功能 */
+  }
 
   try {
     state.failure = await chrome.storage.session.get('gx_last_failure').then((g) => g.gx_last_failure || null);
@@ -520,20 +670,69 @@ async function saveSchedule(id, patch) {
   render();
 }
 
-/** 步骤级编辑：上移 / 下移 / 复制 / 删除。返回是否真的改动了 */
-function moveStep(s, i, dir) {
-  const j = i + dir;
-  if (!Number.isInteger(i) || i < 0 || i >= s.steps.length) return false;
-  if (j < 0 || j >= s.steps.length) return false;
-  const [st] = s.steps.splice(i, 1);
-  s.steps.splice(j, 0, st);
+/** 取某个事件（越界给 null，调用方不用到处判空） */
+function eventAt(s, ei) {
+  return s.events?.[Number(ei)] || null;
+}
+
+/** 取某个事件里的某一步 */
+function stepAt(s, ei, si) {
+  return eventAt(s, ei)?.steps?.[Number(si)] || null;
+}
+
+/** 通用交换，事件和步骤都用它 */
+function swap(arr, i, j) {
+  if (!Array.isArray(arr)) return false;
+  if (i < 0 || j < 0 || i >= arr.length || j >= arr.length) return false;
+  const [x] = arr.splice(i, 1);
+  arr.splice(j, 0, x);
   return true;
 }
 
-function duplicateStep(s, i) {
-  const st = s.steps[i];
+/**
+ * 事件级：上移 / 下移 / 删除。
+ * 事件是编排的最小单位，顺序就是执行顺序 —— 调整流程全靠这几个操作。
+ */
+function moveEvent(s, i, dir) {
+  return swap(s.events, Number(i), Number(i) + dir);
+}
+
+function deleteEvent(s, i) {
+  const idx = Number(i);
+  if (!Array.isArray(s.events) || idx < 0 || idx >= s.events.length) return false;
+  s.events.splice(idx, 1);
+  return true;
+}
+
+/** 新增一个事件，返回它的下标 */
+function addEvent(s, type) {
+  if (!Array.isArray(s.events)) s.events = [];
+  const ev = defaultEvent(type);
+  const same = s.events.filter((x) => x.type === ev.type).length + 1;
+  ev.name = ev.type === 'js' ? `JS ${same}` : `手势 ${same}`;
+  s.events.push(ev);
+  return s.events.length - 1;
+}
+
+/** 步骤级 */
+function moveStep(s, ei, si, dir) {
+  const ev = eventAt(s, ei);
+  return ev ? swap(ev.steps, Number(si), Number(si) + dir) : false;
+}
+
+function duplicateStep(s, ei, si) {
+  const ev = eventAt(s, ei);
+  const st = ev?.steps?.[Number(si)];
   if (!st) return false;
-  s.steps.splice(i + 1, 0, structuredClone(st));
+  ev.steps.splice(Number(si) + 1, 0, structuredClone(st));
+  return true;
+}
+
+function deleteStep(s, ei, si) {
+  const ev = eventAt(s, ei);
+  const idx = Number(si);
+  if (!ev?.steps || idx < 0 || idx >= ev.steps.length) return false;
+  ev.steps.splice(idx, 1);
   return true;
 }
 
@@ -586,7 +785,80 @@ $('#list').addEventListener('click', async (e) => {
   const s = state.scripts.find((x) => x.id === id);
   if (!s) return;
 
-  // ---- 步骤级操作（必须放在 data-act 之前判断，它们不在 [data-act] 上）----
+  // ---- 匹配条件：开关 / 清除 / 快捷 chip ----
+  // 必须排在步骤级按钮之前：这几个按钮和 data-up 之类同在 .step 里
+  const matchBtn = e.target.closest('[data-toggle-match]') || e.target.closest('[data-clear-match]');
+  const chip = e.target.closest('[data-match-add]');
+  if (matchBtn || chip) {
+    e.stopPropagation();
+    const host = (matchBtn || chip).closest('.step');
+    const ei = Number(host?.dataset.ei);
+    const si = Number(host?.dataset.si);
+    const st = stepAt(s, ei, si);
+    if (st) {
+      if (chip) st.match = String(st.match || '') + chip.dataset.matchAdd;
+      else if (matchBtn.dataset.clearMatch !== undefined) st.match = '';
+      else st.match = st.match ? '' : suggestMatch(st);
+      await persistScript(s);
+      render();
+      const box = document.querySelector(`.step[data-ei="${ei}"][data-si="${si}"] input.match`);
+      try {
+        box?.focus?.();
+        box?.select?.();
+      } catch {
+        /* 忽略 */
+      }
+    }
+    return;
+  }
+
+  // ---- 事件级操作 ----
+  const evBtn = e.target.closest('[data-evd]');
+  if (evBtn) {
+    e.stopPropagation();
+    const evAct = evBtn.dataset.evd;
+    const ei = Number(evBtn.dataset.ev);
+    let changed = false;
+
+    if (evAct === 'ev-up') changed = moveEvent(s, ei, -1);
+    else if (evAct === 'ev-down') changed = moveEvent(s, ei, 1);
+    else if (evAct === 'ev-del') {
+      // 删事件是不可逆的，要点两下
+      if (evBtn.dataset.confirm !== '1') {
+        evBtn.dataset.confirm = '1';
+        evBtn.textContent = '确认删除';
+        evBtn.classList.add('danger');
+        return;
+      }
+      changed = deleteEvent(s, ei);
+    } else if (evAct === 'add-wait') {
+      const ev = eventAt(s, ei);
+      if (ev) {
+        ev.steps = ev.steps || [];
+        ev.steps.push({ type: 'wait', value: 1000, delay: 0 });
+        changed = true;
+      }
+    } else if (evAct === 'edit-code') {
+      const ev = eventAt(s, ei);
+      if (ev) {
+        // popup 只有 420px 宽，正经写代码得挪到独立页面
+        chrome.tabs.create({
+          url: chrome.runtime.getURL(
+            `editor/editor.html?task=${encodeURIComponent(s.id)}&event=${encodeURIComponent(ev.id)}`,
+          ),
+        });
+      }
+      return;
+    }
+
+    if (changed) {
+      await persistScript(s);
+      render();
+    }
+    return;
+  }
+
+  // ---- 步骤级操作 ----
   const stepBtn =
     e.target.closest('[data-up]') ||
     e.target.closest('[data-down]') ||
@@ -596,17 +868,12 @@ $('#list').addEventListener('click', async (e) => {
   if (stepBtn) {
     e.stopPropagation();
     const d = stepBtn.dataset;
+    const ei = Number(d.ev);
     let changed = false;
-    if (d.up !== undefined) changed = moveStep(s, Number(d.up), -1);
-    else if (d.down !== undefined) changed = moveStep(s, Number(d.down), 1);
-    else if (d.dup !== undefined) changed = duplicateStep(s, Number(d.dup));
-    else if (d.del !== undefined) {
-      const i = Number(d.del);
-      if (i >= 0 && i < s.steps.length) {
-        s.steps.splice(i, 1);
-        changed = true;
-      }
-    }
+    if (d.up !== undefined) changed = moveStep(s, ei, Number(d.up), -1);
+    else if (d.down !== undefined) changed = moveStep(s, ei, Number(d.down), 1);
+    else if (d.dup !== undefined) changed = duplicateStep(s, ei, Number(d.dup));
+    else if (d.del !== undefined) changed = deleteStep(s, ei, Number(d.del));
     if (changed) {
       await persistScript(s);
       render();
@@ -636,9 +903,9 @@ $('#list').addEventListener('click', async (e) => {
     return;
   }
 
-  if (act === 'add-wait') {
+  if (act === 'add-gesture' || act === 'add-js') {
     e.stopPropagation();
-    s.steps.push({ type: 'wait', value: 1000, delay: 0 });
+    addEvent(s, act === 'add-js' ? 'js' : 'gesture');
     await persistScript(s);
     render();
     return;
@@ -650,7 +917,7 @@ $('#list').addEventListener('click', async (e) => {
       const btn = card.querySelector('[data-act="export"]');
       if (btn) {
         btn.textContent = '已导出';
-        setTimeout(() => { const b = card.querySelector('[data-act="export"]'); if (b) b.textContent = '导出此脚本'; }, 1200);
+        setTimeout(() => { const b = card.querySelector('[data-act="export"]'); if (b) b.textContent = '导出此任务'; }, 1200);
       }
     }
     return;
@@ -729,21 +996,46 @@ $('#list').addEventListener('change', async (e) => {
 
   // 步骤值编辑
   if (e.target.matches('[data-step]')) {
-    const i = Number(e.target.dataset.step);
-    const st = s.steps[i];
+    const st = stepAt(s, e.target.dataset.ev, e.target.dataset.step);
     if (!st) return;
     st.value = st.type === 'wait' ? Number(e.target.value) || 0 : e.target.value;
     await persistScript(s);
     return;
   }
 
+  // 匹配条件（加固定位用）
+  if (e.target.matches('[data-match]')) {
+    const st = stepAt(s, e.target.dataset.ev, e.target.dataset.match);
+    if (!st) return;
+    st.match = String(e.target.value || '').trim();
+    await persistScript(s);
+    return;
+  }
+
   // 步骤延时（修页面抖动最常用的一项）
   if (e.target.matches('[data-delay]')) {
-    const i = Number(e.target.dataset.delay);
-    const st = s.steps[i];
+    const st = stepAt(s, e.target.dataset.ev, e.target.dataset.delay);
     if (!st) return;
     st.delay = Math.max(0, Number(e.target.value) || 0);
     await persistScript(s);
+    return;
+  }
+
+  // ---- 事件级字段 ----
+  const evKey = e.target.dataset.evd;
+  if (evKey) {
+    const ev = eventAt(s, e.target.dataset.ev);
+    if (!ev) return;
+    const raw = e.target.value;
+    if (evKey === 'name') ev.name = String(raw || '').trim();
+    else if (evKey === 'world') ev.world = raw === 'cdp' ? 'cdp' : 'auto';
+    else if (evKey === 'wait-url') ev.wait = { ...(ev.wait || {}), url: String(raw || '').trim() };
+    else if (evKey === 'wait-selector') ev.wait = { ...(ev.wait || {}), selector: String(raw || '').trim() };
+    else if (evKey === 'wait-timeout') ev.wait = { ...(ev.wait || {}), timeoutSec: Math.max(1, Number(raw) || 20) };
+    else return;
+
+    await persistScript(s);
+    if (evKey === 'world') render();
     return;
   }
 
@@ -823,11 +1115,157 @@ $('#pane-settings').addEventListener('change', async (e) => {
   const key = e.target.dataset.set;
   if (!key) return;
   const raw = e.target.type === 'checkbox' ? e.target.checked : e.target.value;
-  const num = ['stepTimeout', 'retry', 'speed', 'minGapMs', 'maxGapMs', 'jitterMs'].includes(key);
+  const num = ['stepTimeout', 'retry', 'speed', 'minGapMs', 'maxGapMs', 'jitterMs', 'logLimit'].includes(key);
   const patch = { [key]: num ? Number(raw) : raw };
   const r = await api({ type: 'SETTINGS_SAVE', patch });
   if (r?.ok) state.settings = { ...DEFAULT_SETTINGS, ...r.settings };
   renderSettings();
+});
+
+/* ================= 云备份（Google Drive） ================= */
+
+function driveMsg(text, kind) {
+  const el = $('#driveMsg');
+  if (!el) return;
+  el.textContent = text || '';
+  el.style.color = kind === 'err' ? 'var(--red)' : kind === 'ok' ? 'var(--green)' : 'var(--ink-3)';
+}
+
+function renderDrive() {
+  const d = state.drive;
+  if (!d) return;
+
+  const redir = $('#driveRedirect');
+  if (redir) redir.textContent = d.redirectUri || '（读不到）';
+
+  // 正在输入时别把用户打了一半的 client id 覆盖回去
+  const box = $('#driveClient');
+  if (box && document.activeElement !== box) box.value = d.clientId || '';
+
+  const conn = $('#btnDriveConnect');
+  if (conn) conn.textContent = d.connected ? '重新连接' : '连接 Google Drive';
+
+  for (const id of ['#btnDriveBackup', '#btnDriveList']) {
+    const b = $(id);
+    if (b) b.disabled = !d.connected;
+  }
+  if (!d.connected && !$('#driveMsg')?.textContent) {
+    driveMsg(d.clientId ? '填好 Client ID 后点「连接」' : '还没填 Client ID');
+  }
+}
+
+/** 云操作的统一外壳：任何失败都要说出来，不能默默什么都没发生 */
+async function driveAction(label, msg) {
+  driveMsg(`${label}中…`);
+  try {
+    const r = await api(msg);
+    if (!r?.ok) throw new Error(r?.error || '操作失败');
+    return r;
+  } catch (e) {
+    driveMsg(`${label}失败：${e?.message || e}`, 'err');
+    return null;
+  }
+}
+
+$('#btnCopyRedirect')?.addEventListener('click', async () => {
+  const t = $('#driveRedirect')?.textContent || '';
+  try {
+    await navigator.clipboard.writeText(t);
+    driveMsg('重定向 URI 已复制，粘到 OAuth 客户端的「已获授权的重定向 URI」里', 'ok');
+  } catch {
+    driveMsg('复制失败，请手动选中复制', 'err');
+  }
+});
+
+$('#driveClient')?.addEventListener('blur', async () => {
+  const v = String($('#driveClient').value || '').trim();
+  if (v === (state.drive?.clientId || '')) return;
+  const r = await api({ type: 'DRIVE_SET_CLIENT', clientId: v });
+  if (r?.ok) {
+    state.drive = r.drive;
+    renderDrive();
+    driveMsg(v ? 'Client ID 已保存' : '已清空 Client ID', v ? 'ok' : '');
+  }
+});
+
+$('#btnDriveConnect')?.addEventListener('click', async () => {
+  const r = await driveAction('连接', { type: 'DRIVE_CONNECT' });
+  if (!r) return;
+  state.drive = r.drive;
+  renderDrive();
+  driveMsg('已连接 Google Drive', 'ok');
+  await loadDriveFiles();
+});
+
+$('#btnDriveOff')?.addEventListener('click', async () => {
+  if (!confirm('断开 Google Drive？只清除本地令牌，云端备份不受影响。')) return;
+  await api({ type: 'DRIVE_DISCONNECT' });
+  const r = await api({ type: 'DRIVE_STATUS' });
+  if (r?.ok) state.drive = r.drive;
+  state.driveFiles = [];
+  renderDrive();
+  renderDriveFiles();
+  driveMsg('已断开', '');
+});
+
+$('#btnDriveBackup')?.addEventListener('click', async () => {
+  const r = await driveAction('备份', { type: 'DRIVE_BACKUP' });
+  if (!r) return;
+  driveMsg(
+    `已备份 ${r.count} 个任务${r.pruned ? `，顺手清了 ${r.pruned} 份最旧的` : ''}`,
+    'ok',
+  );
+  await loadDriveFiles();
+});
+
+$('#btnDriveList')?.addEventListener('click', () => loadDriveFiles(true));
+
+async function loadDriveFiles(showMsg) {
+  const r = await driveAction('读取云端列表', { type: 'DRIVE_LIST' });
+  if (!r) return;
+  state.driveFiles = r.files || [];
+  renderDriveFiles();
+  if (showMsg) driveMsg(`云端有 ${state.driveFiles.length} 份备份`, 'ok');
+}
+
+function renderDriveFiles() {
+  const box = $('#driveFiles');
+  if (!box) return;
+  const files = state.driveFiles || [];
+
+  if (!files.length) {
+    box.innerHTML = '<div class="dim" style="padding:6px 0">云端还没有备份</div>';
+    return;
+  }
+
+  box.innerHTML = files
+    .map((f) => {
+      const when = f.createdTime
+        ? new Date(f.createdTime).toLocaleString('zh-CN', { hour12: false })
+        : f.name || '';
+      const kb = f.size ? `${(Number(f.size) / 1024).toFixed(1)} KB` : '';
+      return `<div class="drive-file">
+  <span class="nm" title="${esc(f.name || '')}">${esc(when)}</span>
+  <span class="dim">${esc(kb)}</span>
+  <button class="btn" data-restore="${esc(f.id)}">恢复</button>
+</div>`;
+    })
+    .join('');
+}
+
+$('#driveFiles')?.addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-restore]');
+  if (!btn) return;
+  if (!confirm('从这份备份恢复？同 id 的任务会跳过，不会覆盖你现在的配置。')) return;
+
+  const r = await driveAction('恢复', { type: 'DRIVE_RESTORE', fileId: btn.dataset.restore });
+  if (!r) return;
+  driveMsg(`恢复完成：新增 ${r.added} 个，跳过 ${r.skipped} 个`, 'ok');
+  await refresh();
+});
+
+$('#btnOpenLogs')?.addEventListener('click', () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL('logs/logs.html') });
 });
 
 /* ================= 备份与恢复 ================= */

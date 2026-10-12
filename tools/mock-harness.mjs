@@ -51,6 +51,9 @@ const L = {
   webNavCommitted: [],
 };
 
+/** 注入执行的可调开关：测试用它模拟「元素一直不出现」和「站点 CSP 拦下 eval」 */
+const execHooks = { selectorFound: true, forceCspBlock: false, cdpValue: null };
+
 /** chrome.contextMenus.create 建出来的菜单项 */
 const menuItems = [];
 
@@ -69,6 +72,7 @@ const calls = {
   offscreen: { create: 0, close: 0, lastJobs: null },
   debugger: { attach: 0, detach: 0 },
   accessLevel: null,
+  oauthUrl: null,
 };
 
 /** offscreen 文档是否处于打开状态 */
@@ -94,7 +98,73 @@ function defaultFrameHandler(msg) {
 }
 
 function installChromeMock() {
-  globalThis.chrome = {
+  globalThis.location = {
+  get href() { return activeTabUrl; },
+  get origin() { try { return new URL(activeTabUrl).origin; } catch { return ''; } },
+};
+globalThis.document = {
+  title: '模拟页面',
+  querySelector: () => null,
+  querySelectorAll: () => [],
+};
+globalThis.performance = globalThis.performance || { now: () => Date.now() };
+
+/** Google Drive 的 fetch 模拟。没有网络，所以这里要把整个链路都摆出来 */
+globalThis.fetchCalls = [];
+globalThis.fetchMode = { tokenError: null };
+const fetchCalls = globalThis.fetchCalls;
+const fetchMode = globalThis.fetchMode;
+
+const jsonRes = (obj, status = 200) => ({
+  ok: status >= 200 && status < 300,
+  status,
+  async json() {
+    return obj;
+  },
+  async text() {
+    return typeof obj === 'string' ? obj : JSON.stringify(obj);
+  },
+});
+
+const CLOUD_BACKUP = JSON.stringify({
+  format: 'gesture-pilot-scripts',
+  version: 1,
+  scripts: [
+    {
+      id: 's_drv',
+      name: '云端来的任务',
+      targetUrl: 'https://drv.test/x',
+      events: [{ id: 'e_d', type: 'gesture', name: '手势', steps: [{ type: 'click', locator: { kind: 'css', value: '#z' }, delay: 0 }] }],
+    },
+  ],
+});
+
+globalThis.fetch = async (url, init = {}) => {
+  const u = String(url);
+  const method = (init.method || 'GET').toUpperCase();
+  fetchCalls.push({ url: u, method, body: init.body });
+
+  if (u.includes('oauth2.googleapis.com/token')) {
+    if (fetchMode.tokenError) return jsonRes({ error: fetchMode.tokenError }, 400);
+    return jsonRes({ access_token: 'AT', refresh_token: 'RT', expires_in: 3600 });
+  }
+  if (u.includes('oauth2.googleapis.com/revoke')) return jsonRes({});
+
+  // 找文件夹（带 mimeType 条件）
+  if (u.includes('/drive/v3/files') && u.includes('mimeType')) return jsonRes({ files: [] });
+  if (u.includes('/drive/v3/files') && method === 'POST') return jsonRes({ id: 'folder-1' });
+  if (u.includes('/upload/drive/v3/files')) {
+    return jsonRes({ id: 'file-1', name: 'backup.json', createdTime: '2026-10-12T02:00:00.000Z' });
+  }
+  if (u.includes('/drive/v3/files') && u.includes('orderBy')) {
+    return jsonRes({ files: [{ id: 'file-1', name: 'backup.json', size: '2048', createdTime: '2026-10-12T02:00:00.000Z' }] });
+  }
+  if (u.includes('alt=media')) return jsonRes(CLOUD_BACKUP);
+  if (method === 'DELETE') return jsonRes({});
+  return jsonRes({});
+};
+
+globalThis.chrome = {
     runtime: {
       onMessage: { addListener: (f) => L.message.push(f) },
       onInstalled: { addListener: (f) => L.installed.push(f) },
@@ -181,14 +251,42 @@ function installChromeMock() {
     windows: { async update() { return {}; } },
 
     scripting: {
-      async executeScript({ files, func, target }) {
+      async executeScript({ files, func, args, target }) {
         calls.executeScript.push({ files, hasFunc: !!func, frameIds: target?.frameIds });
         const ids = target?.frameIds ?? [0];
+
         // 注入了 content script 之后，这些 frame 才开始响应消息
         if (files?.some((f) => f.startsWith('content/'))) {
           for (const id of ids) injectedFrames.add(id);
         }
-        return ids.map((frameId) => ({ frameId, result: undefined }));
+        if (files) return ids.map((frameId) => ({ frameId, result: undefined }));
+        if (!func) return ids.map((frameId) => ({ frameId, result: undefined }));
+
+        const src = String(func);
+
+        // 等元素那段是个短函数，没有 new Function
+        if (!src.includes('new Function')) {
+          return ids.map((frameId) => ({ frameId, result: execHooks.selectorFound }));
+        }
+
+        // JS 事件的注入执行：把函数真的跑一遍，
+        // 这样连用户代码的返回值、console 捕获、异常路径都一起测到了
+        if (execHooks.forceCspBlock) {
+          return ids.map((frameId) => ({
+            frameId,
+            result: {
+              ok: false,
+              name: 'EvalError',
+              error:
+                "Refused to evaluate a string as JavaScript because 'unsafe-eval' is not an allowed source of script",
+              logs: [],
+              via: 'inject',
+            },
+          }));
+        }
+
+        const result = await func(args?.[0] ?? '', args?.[1] ?? {});
+        return ids.map((frameId) => ({ frameId, result }));
       },
     },
 
@@ -212,8 +310,25 @@ function installChromeMock() {
     debugger: {
       async attach() { calls.debugger.attach += 1; },
       async detach() { calls.debugger.detach += 1; },
-      async sendCommand(t, m, p) { calls.debuggerCommands.push({ method: m, params: p }); return {}; },
+      async sendCommand(t, m, p) {
+        calls.debuggerCommands.push({ method: m, params: p });
+        if (m === 'Runtime.evaluate') {
+          return { result: { type: 'object', value: { ok: true, value: execHooks.cdpValue, logs: [], via: 'cdp' } } };
+        }
+        return {};
+      },
       onDetach: { addListener: (f) => L.debuggerDetach.push(f) },
+    },
+
+    identity: {
+      getRedirectURL: () => 'https://mockextensionid.chromiumapp.org/',
+      async launchWebAuthFlow({ url }) {
+        calls.oauthUrl = url;
+        const u = new URL(url);
+        const state = u.searchParams.get('state');
+        // 真实流程里 Google 会把 state 原样带回来，这里照着回显
+        return `${u.searchParams.get('redirect_uri')}?code=TEST_CODE&state=${state}`;
+      },
     },
 
     contextMenus: {
@@ -388,12 +503,13 @@ async function main() {
   const r3 = await sendToBackground({ type: 'RECORD_STOP' });
   check('RECORD_STOP 返回 ok', r3?.ok === true, JSON.stringify(r3));
   check('保存了脚本', !!r3?.saved, JSON.stringify(r3?.saved)?.slice(0, 120));
-  check('脚本含 2 步（重复上报靠 sid 去重）', r3?.saved?.steps?.length === 2, `实际 ${r3?.saved?.steps?.length}`);
+  check('任务含 1 个手势事件（录制结果自动包成事件）', r3?.saved?.events?.length === 1, JSON.stringify(r3?.saved?.events?.length));
+  check('事件含 2 步（重复上报靠 sid 去重）', r3?.saved?.events?.[0]?.steps?.length === 2, `实际 ${r3?.saved?.events?.[0]?.steps?.length}`);
   check('落库的步骤里没有残留 sid',
-    !r3?.saved?.steps?.some((s) => 'sid' in s),
-    JSON.stringify(r3?.saved?.steps?.map((s) => Object.keys(s))));
-  check('第二步 delay 由时间戳重算', r3?.saved?.steps?.[1]?.delay === 1200,
-    `实际 ${r3?.saved?.steps?.[1]?.delay}`);
+    !r3?.saved?.events?.[0]?.steps?.some((s) => 'sid' in s),
+    JSON.stringify(r3?.saved?.events?.[0]?.steps?.map((s) => Object.keys(s))));
+  check('第二步 delay 由时间戳重算', r3?.saved?.events?.[0]?.steps?.[1]?.delay === 1200,
+    `实际 ${r3?.saved?.events?.[0]?.steps?.[1]?.delay}`);
   check('录制状态已清空', !sessionBag.gx_recording);
   check('临时收集区已清空', !sessionBag.gx_collected);
 
@@ -848,15 +964,7 @@ async function main() {
     ['running', 'success'].includes(lastRun?.run?.status) && calls.notifications.length === beforeN,
     JSON.stringify(lastRun?.run)?.slice(0, 140));
 
-  /* ---------------------------------------------------------------- *
-   * [21] 刷新页面 = 新的一次触发
-   *
-   * 曾经的实现只看冷却，导致「脚本跑过一次之后，怎么刷新都不再触发」。
-   * 现在靠导航来源区分：用户主动导航（刷新 / 重新输入地址 / 书签）
-   * 绕过冷却，页面或脚本自己跳转过来的仍然拦。
-   * ---------------------------------------------------------------- */
-
-  console.log('\n\x1b[1m[21] 刷新页面要能重新触发\x1b[0m');
+  console.log('\n\x1b[1m[21] 冷却：自动路径一律受限，只手动豁免\x1b[0m');
   check('注册了导航来源监听', L.webNavCommitted.length === 1, `实际 ${L.webNavCommitted.length}`);
 
   sessionBag.gx_trigger_log = {};
@@ -875,10 +983,7 @@ async function main() {
 
   const RL_SENDER = () => ({ tab: { id: 1, url: activeTabUrl }, frameId: 0, url: activeTabUrl });
   const fireRl = (loadId) =>
-    sendToBackground(
-      { type: 'TRIGGER_FIRE', scriptId: rlScript.id, loadId, url: activeTabUrl },
-      RL_SENDER(),
-    );
+    sendToBackground({ type: 'TRIGGER_FIRE', scriptId: rlScript.id, loadId, url: activeTabUrl }, RL_SENDER());
   const navTo = (url, transitionType) => {
     for (const f of L.webNavCommitted) {
       f({ tabId: 1, frameId: 0, url, transitionType, transitionQualifiers: [] });
@@ -893,58 +998,339 @@ async function main() {
   check('同一次加载内不重复触发（once）',
     rr2?.ok === false && /已经触发过/.test(rr2.skipped || ''), JSON.stringify(rr2));
 
+  // 用户按 F5：上一版这里会绕过冷却，这一版不再绕过 —— 冷却对所有自动路径一视同仁
+  navTo(activeTabUrl, 'reload');
+  await sleep(150);
   const rr3 = await fireRl('R2');
-  check('没有用户导航证据时，新加载仍受冷却限制',
+  check('冷却期内用户刷新也不放行',
     rr3?.ok === false && /冷却中/.test(rr3.skipped || ''), JSON.stringify(rr3));
 
-  // ---- 用户按 F5 ----
+  // 手动运行必须无视冷却 —— 用户明确点了「运行」，那是新的意图
+  sessionBag.gx_trigger_log[rlScript.id] = { at: Date.now() };
+  const man = await sendToBackground({ type: 'SCRIPT_RUN', id: rlScript.id });
+  check('手动运行立刻返回', man?.ok === true, JSON.stringify(man));
+  await sleep(900);
+  const manRun = await sendToBackground({ type: 'RUN_STATE' });
+  check('手动运行不受冷却限制', manRun?.run?.status === 'success', JSON.stringify(manRun?.run)?.slice(0, 160));
+
+  // 定时触发也要过冷却，否则配了短周期就会把页面点烂
+  sessionBag.gx_trigger_log[rlScript.id] = { at: Date.now() };
+  const beforeSched = (await sendToBackground({ type: 'RUN_STATE' }))?.run?.startedAt;
+  await L.alarm[0]({ name: `gx:script:${rlScript.id}` });
+  await sleep(700);
+  const afterSched = (await sendToBackground({ type: 'RUN_STATE' }))?.run?.startedAt;
+  check('定时触发同样被冷却拦住', afterSched === beforeSched, `${beforeSched} -> ${afterSched}`);
+
+  // 冷却过去之后，一切恢复
+  sessionBag.gx_trigger_log[rlScript.id] = { at: Date.now() - 11000 };
   navTo(activeTabUrl, 'reload');
   await sleep(150);
   const rr4 = await fireRl('R3');
-  check('用户按 F5 刷新可以在冷却期内重新触发', rr4?.ok === true, JSON.stringify(rr4));
-  check('结果里标明了这次是刷新来的', rr4?.reload === true, JSON.stringify(rr4));
+  check('冷却结束后刷新恢复触发', rr4?.ok === true, JSON.stringify(rr4));
   await sleep(900);
-
-  // ---- 再刷一次：必须还能触发，才是「每次都重新跑」 ----
-  navTo(activeTabUrl, 'reload');
-  await sleep(150);
-  const rr5 = await fireRl('R4');
-  check('连续刷新每次都能重新触发', rr5?.ok === true, JSON.stringify(rr5));
-  await sleep(900);
-
-  // ---- 地址栏重新输入 ----
-  navTo(activeTabUrl, 'typed');
-  await sleep(150);
-  const rr6 = await fireRl('R5');
-  check('地址栏重新输入也算新的一次意图', rr6?.ok === true, JSON.stringify(rr6));
-  await sleep(900);
-
-  // ---- 脚本自己点链接跳过来的：必须仍然被拦，否则会无限自己触发自己 ----
-  navTo(activeTabUrl, 'link');
-  await sleep(150);
-  const rr7 = await fireRl('R6');
-  check('脚本点链接跳转过来的仍被冷却拦住（防死循环）',
-    rr7?.ok === false && /冷却中/.test(rr7.skipped || ''), JSON.stringify(rr7));
-
-  // ---- 导航记录来自别的站点：不能拿来当「用户刷新」的证据 ----
-  navTo('https://somewhere-else.test/x', 'reload');
-  await sleep(150);
-  const rr8 = await fireRl('R7');
-  check('导航记录来自别的站点时不放行',
-    rr8?.ok === false && /冷却中/.test(rr8.skipped || ''), JSON.stringify(rr8));
 
   check('跳过原因被记下来（界面直接显示，不用开控制台）',
     /冷却中/.test(sessionBag.gx_trigger_log?.[`skip_${rlScript.id}`]?.reason || ''),
     JSON.stringify(sessionBag.gx_trigger_log?.[`skip_${rlScript.id}`]));
 
-  // ---- 子 frame 的导航不能污染顶层判定 ----
-  for (const f of L.webNavCommitted) {
-    f({ tabId: 1, frameId: 3, url: activeTabUrl, transitionType: 'reload', transitionQualifiers: [] });
-  }
-  await sleep(150);
-  const rr9 = await fireRl('R8');
-  check('子 frame 的刷新不算顶层用户导航（仍受冷却限制）',
-    rr9?.ok === false && /冷却中/.test(rr9.skipped || ''), JSON.stringify(rr9));
+  // 导航来源仍然记着，日志里能看出这次是刷新来的
+  check('记录里标明了触发来源',
+    ['reload', 'page'].includes(sessionBag.gx_trigger_log?.[rlScript.id]?.trigger),
+    JSON.stringify(sessionBag.gx_trigger_log?.[rlScript.id]));
+
+  /* ---------------------------------------------------------------- *
+   * [22] 事件组：手势与 JS 混排，按顺序串起来
+   * ---------------------------------------------------------------- */
+
+  console.log('\n\x1b[1m[22] 事件组串行执行（手势 + JS 混排）\x1b[0m');
+  sessionBag.gx_trigger_log = {};
+  localBag.gx_scripts = [];
+  localBag.gx_settings = { debug: true, logLimit: 200 };
+  injectedFrames.clear();
+  frameHandlers.clear();
+  frameHandlers.set(0, defaultFrameHandler);
+  activeTabUrl = 'https://mix.test/app';
+  execHooks.selectorFound = true;
+  execHooks.forceCspBlock = false;
+
+  const mixTask = await makeScript({
+    targetUrl: 'https://mix.test/app',
+    events: [
+      {
+        id: 'ev_a', type: 'gesture', name: '第一步',
+        steps: [{ type: 'click', locator: { kind: 'css', value: '#a' }, rel: { x: 0.5, y: 0.5 }, delay: 0 }],
+      },
+      { id: 'ev_b', type: 'js', name: '取数', code: 'return 42;' },
+      {
+        id: 'ev_c', type: 'gesture', name: '收尾',
+        steps: [{ type: 'click', locator: { kind: 'css', value: '#b' }, rel: { x: 0.5, y: 0.5 }, delay: 0 }],
+      },
+    ],
+  });
+
+  check('任务读出来是 3 个事件', mixTask.events.length === 3, JSON.stringify(mixTask.events?.length));
+  check('JS 事件带上了 id 和类型', mixTask.events[1].id === 'ev_b' && mixTask.events[1].type === 'js');
+  check('手势事件保住了步骤', mixTask.events[0].steps?.length === 1);
+
+  await sendToBackground({ type: 'LOG_CLEAR' });
+  await sendToBackground({ type: 'SCRIPT_RUN', id: mixTask.id });
+  await sleep(2600);
+
+  const mixRun = await sendToBackground({ type: 'RUN_STATE' });
+  check('事件组整体跑完', mixRun?.run?.status === 'success', JSON.stringify(mixRun?.run)?.slice(0, 170));
+
+  const mixLogs = (await sendToBackground({ type: 'LOG_READ' }))?.logs || [];
+  const order = mixLogs.filter((l) => l.eventName).map((l) => l.eventName);
+  const iA = order.indexOf('第一步');
+  const iB = order.indexOf('取数');
+  const iC = order.indexOf('收尾');
+  check('三个事件严格按定义顺序执行', iA >= 0 && iA < iB && iB < iC, JSON.stringify(order));
+
+  check('JS 事件真的被执行了',
+    mixLogs.some((l) => l.eventName === '取数' && /JS 事件完成/.test(l.msg)),
+    JSON.stringify(mixLogs.filter((l) => l.eventName === '取数').map((l) => l.msg)));
+  check('JS 的 return 值记进了日志',
+    mixLogs.some((l) => l.eventName === '取数' && l.data && l.data.value === 42),
+    JSON.stringify(mixLogs.find((l) => l.eventName === '取数' && l.data)?.data));
+  check('日志按事件分了组（可按事件过滤）',
+    mixLogs.some((l) => l.eventIndex === 2 && l.eventName === '收尾'));
+
+  /* ---------------------------------------------------------------- *
+   * [23] 事件级等待条件：等不到就跳过这一个，不拖垮整条任务
+   * ---------------------------------------------------------------- */
+
+  console.log('\n\x1b[1m[23] 事件级等待条件\x1b[0m');
+  execHooks.selectorFound = false; // 假装元素一直不出现
+
+  const gateTask = await makeScript({
+    targetUrl: 'https://mix.test/app',
+    events: [
+      {
+        id: 'g1', type: 'gesture', name: '等不到',
+        wait: { url: '', selector: '#never', timeoutSec: 1 },
+        steps: [{ type: 'click', locator: { kind: 'css', value: '#x' }, rel: { x: 0.5, y: 0.5 }, delay: 0 }],
+      },
+      {
+        id: 'g2', type: 'gesture', name: '照跑',
+        steps: [{ type: 'click', locator: { kind: 'css', value: '#y' }, rel: { x: 0.5, y: 0.5 }, delay: 0 }],
+      },
+    ],
+  });
+
+  await sendToBackground({ type: 'LOG_CLEAR' });
+  await sendToBackground({ type: 'SCRIPT_RUN', id: gateTask.id });
+  await sleep(4000);
+
+  const gateRun = await sendToBackground({ type: 'RUN_STATE' });
+  check('个别事件等不到元素不至于让整条任务失败',
+    gateRun?.run?.status === 'success', JSON.stringify(gateRun?.run)?.slice(0, 170));
+  check('被跳过的事件记在结果里（界面能直接看到）',
+    (gateRun?.run?.skips || []).some((s) => /等不到元素/.test(s.reason)),
+    JSON.stringify(gateRun?.run?.skips));
+  check('等元素超时按配置的秒数走', (gateRun?.run?.skips || [])[0]?.eventName === '等不到');
+
+  execHooks.selectorFound = true;
+
+  /* ---------------------------------------------------------------- *
+   * [24] 日志：开关与环形缓冲
+   * ---------------------------------------------------------------- */
+
+  console.log('\n\x1b[1m[24] 执行日志：开关与环形缓冲\x1b[0m');
+  await sendToBackground({ type: 'SETTINGS_SAVE', patch: { debug: false } });
+  const beforeLogs = (await sendToBackground({ type: 'LOG_READ' }))?.logs.length || 0;
+  await sendToBackground({ type: 'SCRIPT_RUN', id: mixTask.id });
+  await sleep(2600);
+  const afterLogs = (await sendToBackground({ type: 'LOG_READ' }))?.logs.length || 0;
+  check('关掉 debug 之后一条日志都不再产生', afterLogs === beforeLogs, `${beforeLogs} -> ${afterLogs}`);
+
+  await sendToBackground({ type: 'SETTINGS_SAVE', patch: { debug: true, logLimit: 50 } });
+  await sendToBackground({ type: 'LOG_CLEAR' });
+  await sendToBackground({ type: 'SCRIPT_RUN', id: mixTask.id });
+  await sleep(2600);
+  const capped = await sendToBackground({ type: 'LOG_READ' });
+  check('日志按上限裁剪（不会无限涨）', (capped?.logs || []).length <= 50, `实际 ${capped?.logs?.length}`);
+  check('统计信息带回上限，设置页能显示', capped?.stats?.limit === 50, JSON.stringify(capped?.stats));
+  check('清空之后重新开始记', (capped?.logs || []).length > 0, `实际 ${capped?.logs?.length}`);
+
+  /* ---------------------------------------------------------------- *
+   * [25] 老任务（只有扁平 steps）自动迁移
+   * ---------------------------------------------------------------- */
+
+  console.log('\n\x1b[1m[25] 老任务自动迁移成事件结构\x1b[0m');
+  localBag.gx_scripts = [
+    {
+      id: 's_legacy2',
+      name: '老任务',
+      targetUrl: 'https://old.test/x',
+      steps: [{ type: 'click', locator: { kind: 'css', value: '#z' }, rel: { x: 0.5, y: 0.5 }, delay: 0 }],
+    },
+  ];
+
+  const listed = await sendToBackground({ type: 'SCRIPT_LIST' });
+  const legacy2 = listed.scripts.find((s) => s.id === 's_legacy2');
+  check('扁平的 steps 被包成一个手势事件',
+    legacy2?.events?.length === 1 && legacy2.events[0].type === 'gesture',
+    JSON.stringify(legacy2?.events));
+  check('原有步骤原样保留', legacy2?.events?.[0]?.steps?.length === 1,
+    JSON.stringify(legacy2?.events?.[0]?.steps));
+  check('顶层不再保留 steps（避免两份真相）', !('steps' in legacy2), Object.keys(legacy2 || {}).join(','));
+  check('老任务补齐了等待条件结构',
+    legacy2?.events?.[0]?.wait && typeof legacy2.events[0].wait.timeoutSec === 'number',
+    JSON.stringify(legacy2?.events?.[0]?.wait));
+
+  /* ---------------------------------------------------------------- *
+   * [26] 步骤匹配条件：后端只负责透传，校验在页面侧
+   * ---------------------------------------------------------------- */
+
+  console.log('\n\x1b[1m[26] 步骤匹配条件透传\x1b[0m');
+  const matchTask = await makeScript({
+    targetUrl: 'https://mix.test/app',
+    events: [{
+      type: 'gesture',
+      name: '带条件',
+      steps: [{ type: 'click', locator: { kind: 'css', value: '#m' }, rel: { x: 0.5, y: 0.5 }, delay: 0, match: '.green[href]' }],
+    }],
+  });
+  check('匹配条件原样落库', matchTask.events[0].steps[0].match === '.green[href]',
+    JSON.stringify(matchTask.events[0].steps[0].match));
+
+  /* ---------------------------------------------------------------- *
+   * [27] JS 事件：注入被站点 CSP 拦下时，自动切到调试接口
+   * ---------------------------------------------------------------- */
+
+  console.log('\n\x1b[1m[27] JS 事件：CSP 拦下后自动降级到调试接口\x1b[0m');
+  execHooks.forceCspBlock = true;
+  execHooks.cdpValue = '来自调试接口的返回值';
+  calls.debuggerCommands.length = 0;
+  calls.debugger.attach = 0;
+  calls.debugger.detach = 0;
+
+  const cspTask = await makeScript({
+    targetUrl: 'https://mix.test/app',
+    events: [{ id: 'c_1', type: 'js', name: 'CSP 场景', code: 'return 1;', world: 'auto' }],
+  });
+
+  await sendToBackground({ type: 'LOG_CLEAR' });
+  await sendToBackground({ type: 'SCRIPT_RUN', id: cspTask.id });
+  await sleep(2200);
+
+  const cspRun = await sendToBackground({ type: 'RUN_STATE' });
+  check('注入被 CSP 拦下后，任务靠调试接口照样跑成',
+    cspRun?.run?.status === 'success', JSON.stringify(cspRun?.run)?.slice(0, 170));
+  check('attach 了调试接口', calls.debugger.attach >= 1, `实际 ${calls.debugger.attach}`);
+  check('发了 Runtime.evaluate',
+    calls.debuggerCommands.some((c) => c.method === 'Runtime.evaluate'),
+    JSON.stringify(calls.debuggerCommands.map((c) => c.method)));
+  check('任务结束后断开调试连接（否则页面提示条一直挂着）',
+    calls.debugger.detach >= 1, `实际 ${calls.debugger.detach}`);
+
+  const cspLogs = (await sendToBackground({ type: 'LOG_READ' }))?.logs || [];
+  check('日志里写明了是 CSP 导致的降级',
+    cspLogs.some((l) => /CSP/.test(l.msg)), JSON.stringify(cspLogs.map((l) => l.msg).slice(0, 12)));
+  check('完成日志里记下了实际走的哪条路',
+    cspLogs.some((l) => /JS 事件完成/.test(l.msg) && l.data && l.data.via === 'cdp'),
+    JSON.stringify(cspLogs.find((l) => /JS 事件完成/.test(l.msg))?.data));
+  check('降级标记也一并记下', cspLogs.some((l) => l.data && l.data.fellBack === true));
+
+  // 用户代码自己写错了不该触发降级 —— 否则报错信息会变得莫名其妙
+  execHooks.forceCspBlock = false;
+  calls.debuggerCommands.length = 0;
+  calls.debugger.attach = 0;
+
+  const errTask = await makeScript({
+    targetUrl: 'https://mix.test/app',
+    events: [{ id: 'c_2', type: 'js', name: '会抛错', code: 'throw new Error("用户代码自己炸了");' }],
+  });
+
+  await sendToBackground({ type: 'LOG_CLEAR' });
+  await sendToBackground({ type: 'SCRIPT_RUN', id: errTask.id });
+  await sleep(1800);
+
+  const errRun = await sendToBackground({ type: 'RUN_STATE' });
+  check('用户代码自身的错误不会触发降级重试',
+    calls.debuggerCommands.filter((c) => c.method === 'Runtime.evaluate').length === 0,
+    JSON.stringify(calls.debuggerCommands.map((c) => c.method)));
+  check('任务如实失败', errRun?.run?.status === 'failed', JSON.stringify(errRun?.run)?.slice(0, 170));
+  check('失败信息里带上事件位置',
+    errRun?.run?.scriptId === errTask.id && /用户代码自己炸了/.test(sessionBag.gx_last_failure?.error || ''),
+    JSON.stringify(sessionBag.gx_last_failure?.error));
+
+  execHooks.cdpValue = null;
+
+  /* ---------------------------------------------------------------- *
+   * [28] Google Drive 云备份
+   * ---------------------------------------------------------------- */
+
+  console.log('\n\x1b[1m[28] Google Drive 云备份\x1b[0m');
+  sessionBag.gx_trigger_log = {};
+  localBag.gx_scripts = [];
+  localBag.gx_settings = {};
+  delete localBag.gx_drive_auth;
+
+  const drvSt0 = await sendToBackground({ type: 'DRIVE_STATUS' });
+  check('初始状态是未连接', drvSt0?.drive?.connected === false, JSON.stringify(drvSt0?.drive));
+  check('带回重定向 URI（用户要填进 Google Cloud 控制台）',
+    /chromiumapp\.org/.test(drvSt0?.drive?.redirectUri || ''), drvSt0?.drive?.redirectUri);
+
+  const drvSet = await sendToBackground({
+    type: 'DRIVE_SET_CLIENT',
+    clientId: 'cid.apps.googleusercontent.com',
+  });
+  check('Client ID 保存成功',
+    drvSet?.drive?.clientId === 'cid.apps.googleusercontent.com', JSON.stringify(drvSet?.drive));
+
+  const drvConn = await sendToBackground({ type: 'DRIVE_CONNECT' });
+  check('连接后状态变为已连接', drvConn?.drive?.connected === true, JSON.stringify(drvConn?.drive));
+  check('授权地址带上了 PKCE 参数',
+    /code_challenge=/.test(calls.oauthUrl || '') && /code_challenge_method=S256/.test(calls.oauthUrl || ''),
+    String(calls.oauthUrl).slice(0, 180));
+  check('要的是 offline 授权（否则拿不到 refresh token，每次都得重新登）',
+    /access_type=offline/.test(calls.oauthUrl || ''));
+  check('scope 只覆盖本应用创建的文件，看不到用户 Drive 里的其他东西',
+    /drive\.file/.test(decodeURIComponent(calls.oauthUrl || '')),
+    decodeURIComponent(calls.oauthUrl || '').slice(0, 200));
+
+  const drvBak = await sendToBackground({ type: 'DRIVE_BACKUP' });
+  check('备份成功并带回任务数', drvBak?.ok === true && typeof drvBak.count === 'number', JSON.stringify(drvBak));
+  check('上传走的是 multipart 上传接口',
+    globalThis.fetchCalls.some((c) => /upload\/drive\/v3/.test(c.url) && c.method === 'POST'),
+    JSON.stringify(globalThis.fetchCalls.map((c) => `${c.method} ${c.url.slice(0, 60)}`).slice(0, 8)));
+
+  const drvLst = await sendToBackground({ type: 'DRIVE_LIST' });
+  check('能列出云端备份', (drvLst?.files || []).length === 1, JSON.stringify(drvLst?.files));
+
+  const drvRst = await sendToBackground({ type: 'DRIVE_RESTORE', fileId: 'file-1' });
+  check('恢复把云端的任务导了进来', drvRst?.added === 1, JSON.stringify(drvRst));
+
+  const drvAfter = await sendToBackground({ type: 'SCRIPT_LIST' });
+  check('恢复出来的任务确实在列表里',
+    drvAfter.scripts.some((s) => s.id === 's_drv'),
+    drvAfter.scripts.map((s) => s.id).join(','));
+
+  await sendToBackground({ type: 'DRIVE_DISCONNECT' });
+  const drvSt1 = await sendToBackground({ type: 'DRIVE_STATUS' });
+  check('断开后回到未连接', drvSt1?.drive?.connected === false, JSON.stringify(drvSt1?.drive));
+  check('断开只清本地令牌，没有去动云端文件',
+    !globalThis.fetchCalls.some((c) => /\/files\//.test(c.url) && c.method === 'DELETE'));
+
+  await sendToBackground({ type: 'DRIVE_SET_CLIENT', clientId: '' });
+  const drvNoCid = await sendToBackground({ type: 'DRIVE_CONNECT' });
+  check('没填 Client ID 时给出能照着做的提示',
+    drvNoCid?.ok === false && /Client ID/.test(drvNoCid.error || ''), JSON.stringify(drvNoCid));
+
+  // 授权被撤销后不能一直拿着废 token 重试
+  localBag.gx_drive_auth = {
+    clientId: 'cid.apps.googleusercontent.com',
+    refreshToken: 'stale',
+    accessToken: '',
+    expiresAt: 0,
+  };
+  globalThis.fetchMode.tokenError = 'invalid_grant';
+  const drvStale = await sendToBackground({ type: 'DRIVE_LIST' });
+  check('授权被撤销时给出「重新连接」而不是原始报错',
+    drvStale?.ok === false && /重新连接|撤销/.test(drvStale.error || ''), JSON.stringify(drvStale));
+  check('失效的令牌被顺手清掉了', !localBag.gx_drive_auth?.refreshToken);
+  globalThis.fetchMode.tokenError = null;
 
   report();
 }

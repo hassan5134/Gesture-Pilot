@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>执行日志 · Gesture Pilot</title>
+    <style>
+      :root {
+        --bg: #ffffff;
+        --bg-2: #f7f8fa;
+        --bg-3: #eef1f5;
+        --line: #e3e7ee;
+        --ink: #1c2230;
+        --ink-2: #5b6472;
+        --ink-3: #8b94a3;
+        --blue: #185fa5;
+        --blue-bg: #e6f1fb;
+        --green: #0f6e56;
+        --green-bg: #e1f5ee;
+        --red: #a32d2d;
+        --red-bg: #fcebeb;
+        --amber: #854f0b;
+        --amber-bg: #faeeda;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font: 13px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+        color: var(--ink);
+        background: var(--bg-2);
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 11px 18px;
+        background: var(--bg);
+        border-bottom: 1px solid var(--line);
+        position: sticky;
+        top: 0;
+        z-index: 5;
+        flex-wrap: wrap;
+      }
+      .title { font-weight: 600; }
+      .grow { flex: 1; }
+      .stat { font-size: 12px; color: var(--ink-3); }
+      body.off .stat { color: var(--amber); }
+      select, input[type="search"] {
+        font: inherit;
+        font-size: 12px;
+        padding: 4px 8px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--bg);
+        color: var(--ink);
+      }
+      input[type="search"] { min-width: 180px; }
+      select:focus, input:focus { outline: none; border-color: var(--blue); }
+      button {
+        font: inherit;
+        font-size: 12px;
+        padding: 5px 11px;
+        border-radius: 6px;
+        border: 1px solid var(--line);
+        background: var(--bg);
+        color: var(--ink);
+        cursor: pointer;
+      }
+      button:hover { border-color: var(--blue); color: var(--blue); }
+      label.sw { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ink-2); }
+
+      main { padding: 12px 18px 40px; }
+      .list { display: flex; flex-direction: column; gap: 3px; }
+      .row {
+        display: flex;
+        align-items: flex-start;
+        gap: 9px;
+        padding: 6px 10px;
+        background: var(--bg);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        font-size: 12px;
+      }
+      .row.ok { border-left: 3px solid var(--green); }
+      .row.info { border-left: 3px solid var(--line); }
+      .row.warn { border-left: 3px solid var(--amber); background: #fffdf8; }
+      .row.error { border-left: 3px solid var(--red); background: #fffafa; }
+      .t {
+        flex: none;
+        width: 78px;
+        color: var(--ink-3);
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 11px;
+        padding-top: 1px;
+      }
+      .lv {
+        flex: none;
+        width: 42px;
+        font-size: 10px;
+        font-weight: 600;
+        text-align: center;
+        padding: 1px 0;
+        border-radius: 4px;
+        margin-top: 1px;
+      }
+      .lv.ok { background: var(--green-bg); color: var(--green); }
+      .lv.info { background: var(--bg-3); color: var(--ink-2); }
+      .lv.warn { background: var(--amber-bg); color: var(--amber); }
+      .lv.error { background: var(--red-bg); color: var(--red); }
+      .who { flex: none; max-width: 190px; }
+      .who .task { font-weight: 600; }
+      .who .ev { color: var(--ink-3); font-size: 11px; }
+      .msg { flex: 1; min-width: 0; word-break: break-word; }
+      .data {
+        margin: 4px 0 0;
+        padding: 6px 8px;
+        background: var(--bg-3);
+        border-radius: 4px;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 11px;
+        white-space: pre-wrap;
+        word-break: break-all;
+        color: var(--ink-2);
+        max-height: 240px;
+        overflow: auto;
+      }
+      details summary {
+        cursor: pointer;
+        color: var(--ink-3);
+        font-size: 11px;
+        margin-top: 3px;
+        list-style: none;
+      }
+      details summary::-webkit-details-marker { display: none; }
+      details summary:hover { color: var(--blue); }
+      .empty {
+        padding: 60px 20px;
+        text-align: center;
+        color: var(--ink-3);
+        line-height: 1.8;
+      }
+      .hint {
+        margin: 0 0 12px;
+        padding: 9px 12px;
+        background: var(--amber-bg);
+        border-radius: 7px;
+        font-size: 12px;
+        color: var(--amber);
+        line-height: 1.6;
+      }
+      code {
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        background: rgba(0, 0, 0, .06);
+        padding: 1px 4px;
+        border-radius: 3px;
+        font-size: 11px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span class="title">执行日志</span>
+      <span class="stat" id="stat">载入中…</span>
+      <span class="grow"></span>
+      <select id="fTask"><option value="">全部任务</option></select>
+      <select id="fLevel">
+        <option value="">全部级别</option>
+        <option value="error">只看错误</option>
+        <option value="warn">警告及以上</option>
+        <option value="ok">只看完成</option>
+      </select>
+      <input id="fText" type="search" placeholder="搜消息 / 数据" />
+      <label class="sw"><input type="checkbox" id="auto" checked /> 自动刷新</label>
+      <button id="btnRefresh">刷新</button>
+      <button id="btnExport">导出</button>
+      <button id="btnClear">清空</button>
+    </header>
+
+    <main>
+      <div class="hint" id="hint" hidden>
+        日志是关着的。去 popup 的<strong>设置</strong>页打开 <strong>Debug</strong>，
+        之后的执行过程才会被记下来。
+      </div>
+      <div class="list" id="list"></div>
+      <div class="empty" id="empty" hidden>
+        还没有日志。<br />
+        打开 Debug 开关后跑一次任务，这里就会出现每一步的执行情况。
+      </div>
+    </main>
+
+    <script src="logs.js" type="module"></script>
+  </body>
+</html>

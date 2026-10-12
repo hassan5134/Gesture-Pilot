@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Gesture Pilot · 手势助手",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "录制鼠标与键盘操作，按计划自动重放，用于辅助重复性页面操作。",
   "minimum_chrome_version": "116",
 
@@ -14,9 +14,15 @@
     "offscreen",
     "notifications",
     "contextMenus",
-    "debugger"
+    "debugger",
+    "identity"
   ],
-  "host_permissions": ["<all_urls>"],
+  "host_permissions": [
+    "<all_urls>",
+    "https://www.googleapis.com/*",
+    "https://oauth2.googleapis.com/*",
+    "https://accounts.google.com/*"
+  ],
 
   "background": {
     "service_worker": "background.js",

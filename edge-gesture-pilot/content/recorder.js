@@ -124,7 +124,7 @@
 
   /* ---------------- 步骤缓冲区 ---------------- */
 
-  function push(step) {
+  function push(step, el) {
     const ts = step.ts ?? Date.now();
     step.ts = ts;
     // 首步没有「等待」语义，间隔置 0
@@ -134,6 +134,16 @@
     step.sid = `${SESSION_ID}:${steps.length}`;
     // 非顶层 frame 的步骤带上来源 URL，回放时用于投递到正确的 frame
     if (!IS_TOP) step.frameUrl = location.href;
+    // 顺手记下目标元素的 class / 属性名。回放不是非它不可，
+    // 但有了它，用户就能在界面上点一下给这一步加「必须匹配 .green」这类条件，
+    // 而不必回页面开 DevTools 自己抄选择器。
+    if (el) {
+      try {
+        step.el = GX.elementHints(el);
+      } catch {
+        /* 只是锦上添花，失败不能影响录制 */
+      }
+    }
     steps.push(step);
     HUD.call('setStepCount', steps.length);
     scheduleStream();
@@ -181,7 +191,7 @@
       value: p.value,
       tag: p.tag.toLowerCase(),
       ts: p.ts,
-    });
+    }, p.el);
   }
 
   function noteInput(el) {
@@ -286,7 +296,7 @@
         path: simplifyPath(c.pts, 48),
         button: 0,
         ts: c.ts,
-      });
+      }, c.el);
       return;
     }
 
@@ -304,7 +314,7 @@
       rel: relPoint(c.x, c.y, r),
       tag,
       ts: c.ts,
-    });
+    }, c.el);
   };
 
   /** 只服务于提示层与拖拽路径采集，不参与点击步骤的生成 */
@@ -355,7 +365,7 @@
         value: GX.readValue(el),
         tag: 'select',
         ts: Date.now(),
-      });
+      }, el);
       return;
     }
     if (el.tagName === 'INPUT') {
@@ -369,7 +379,7 @@
           rel: { x: 0.5, y: 0.5 },
           tag: 'input',
           ts: Date.now(),
-        });
+        }, el);
       }
     }
   };
@@ -407,7 +417,7 @@
         meta: e.metaKey,
       },
       ts: Date.now(),
-    });
+    }, el);
   };
 
   const onKeyUp = (e) => {

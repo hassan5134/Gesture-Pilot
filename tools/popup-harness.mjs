@@ -334,7 +334,10 @@ async function main() {
             id: 's1',
             name: '测试脚本',
             targetUrl: 'https://example.com/app',
-            steps: [{ type: 'click', locator: { kind: 'css', value: '#go' }, rel: { x: 0.5, y: 0.5 }, delay: 0 }],
+            events: [{
+              id: 'ev1', name: '手势', type: 'gesture', enabled: true, wait: { ...EV_WAIT },
+              steps: [{ type: 'click', locator: { kind: 'css', value: '#go' }, rel: { x: 0.5, y: 0.5 }, delay: 0 }],
+            }],
             engine: null,
             schedule: { enabled: false, mode: 'interval', everySec: 1800, time: '09:30' },
             trigger: {
@@ -470,50 +473,50 @@ async function main() {
   check('首步上移按钮被禁用', /data-up="0"[^>]*disabled/.test(body2), body2.match(/data-up="0"[^>]*/)?.[0]);
   check('末步下移按钮被禁用', /data-down="1"[^>]*disabled/.test(body2), body2.match(/data-down="1"[^>]*/)?.[0]);
   check('定时配置里有生效域名', body2.includes('data-sched="domains"'));
-  check('有「插入等待」按钮', body2.includes('data-act="add-wait"'));
+  check('有「插入等待」按钮', body2.includes('data-evd="add-wait"'));
   check('有「导出此脚本」按钮', body2.includes('data-act="export"'));
 
   // ---- 步骤下移 ----
   sendMessageCalls.length = 0;
-  await listClick(fakeEvent({ closest: { ...CARD, '[data-down]': { dataset: { down: '0' } } } }));
+  await listClick(fakeEvent({ closest: { ...CARD, '[data-down]': { dataset: { down: '0', ev: '0' } } } }));
   await sleep(120);
   let upd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
   check('下移步骤后顺序变了',
-    upd?.script?.steps?.[0]?.locator?.value === '#second',
-    JSON.stringify(upd?.script?.steps?.map((x) => x.locator?.value)));
+    upd?.script?.events?.[0]?.steps?.[0]?.locator?.value === '#second',
+    JSON.stringify(upd?.script?.events?.[0]?.steps?.map((x) => x.locator?.value)));
 
   // ---- 步骤复制 ----
   sendMessageCalls.length = 0;
-  await listClick(fakeEvent({ closest: { ...CARD, '[data-dup]': { dataset: { dup: '0' } } } }));
+  await listClick(fakeEvent({ closest: { ...CARD, '[data-dup]': { dataset: { dup: '0', ev: '0' } } } }));
   await sleep(120);
   upd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
-  check('复制步骤后多了一步', upd?.script?.steps?.length === 3,
-    `实际 ${upd?.script?.steps?.length}`);
+  check('复制步骤后多了一步', upd?.script?.events?.[0]?.steps?.length === 3,
+    `实际 ${upd?.script?.events?.[0]?.steps?.length}`);
 
   // ---- 步骤删除 ----
   sendMessageCalls.length = 0;
-  await listClick(fakeEvent({ closest: { ...CARD, '[data-del]': { dataset: { del: '0' } } } }));
+  await listClick(fakeEvent({ closest: { ...CARD, '[data-del]': { dataset: { del: '0', ev: '0' } } } }));
   await sleep(120);
   upd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
-  check('删除步骤后少了一步', upd?.script?.steps?.length === 2,
-    `实际 ${upd?.script?.steps?.length}`);
+  check('删除步骤后少了一步', upd?.script?.events?.[0]?.steps?.length === 2,
+    `实际 ${upd?.script?.events?.[0]?.steps?.length}`);
 
   // ---- 插入等待 ----
   sendMessageCalls.length = 0;
-  await listClick(fakeEvent({ closest: { ...CARD, '[data-act]': { dataset: { act: 'add-wait' } } } }));
+  await listClick(fakeEvent({ closest: { ...CARD, '[data-evd]': { dataset: { evd: 'add-wait', ev: '0' } } } }));
   await sleep(120);
   upd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
-  const added = upd?.script?.steps?.at(-1);
+  const added = upd?.script?.events?.[0]?.steps?.at(-1);
   check('插入等待步骤', added?.type === 'wait' && typeof added.value === 'number',
     JSON.stringify(added));
 
   // ---- 步骤延时编辑 ----
   sendMessageCalls.length = 0;
-  await listChange(fakeEvent({ matches: ['[data-delay]'], closest: CARD, dataset: { delay: '0' }, value: '2500' }));
+  await listChange(fakeEvent({ matches: ['[data-delay]'], closest: CARD, dataset: { delay: '0', ev: '0' }, value: '2500' }));
   await sleep(120);
   upd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
-  check('步骤延时被写入', upd?.script?.steps?.[0]?.delay === 2500,
-    JSON.stringify(upd?.script?.steps?.[0]?.delay));
+  check('步骤延时被写入', upd?.script?.events?.[0]?.steps?.[0]?.delay === 2500,
+    JSON.stringify(upd?.script?.events?.[0]?.steps?.[0]?.delay));
 
   // ---- 脚本启停 ----
   sendMessageCalls.length = 0;
@@ -587,15 +590,170 @@ async function main() {
   check('空输入给出提示', /请先把导出的 JSON/.test(el('#importMsg')?.__state?.textContent || ''),
     el('#importMsg')?.__state?.textContent);
 
+  /* ---------------- 事件组界面 ---------------- */
+
+  console.log('\n\x1b[1m[10] 事件组界面：新增 / 排序 / 改名 / 等待条件 / 匹配条件\x1b[0m');
+
+  let evScripts = [
+    makeScriptFixture([
+      {
+        type: 'click',
+        locator: { kind: 'css', value: '#a' },
+        rel: { x: 0.5, y: 0.5 },
+        delay: 0,
+        el: { tag: 'a', cls: ['green'], attrs: [{ name: 'href', value: '/d' }] },
+      },
+    ]),
+  ];
+
+  installGlobals({
+    respond: (msg) => {
+      if (msg.type === 'SCRIPT_LIST') {
+        return {
+          ok: true, version: MOCK_VERSION,
+          scripts: JSON.parse(JSON.stringify(evScripts)),
+          settings: {}, run: null, triggerLog: {}, logStats: { count: 0, limit: 1000, enabled: true },
+        };
+      }
+      if (msg.type === 'RECORD_STATE') return { ok: true, recording: null };
+      if (msg.type === 'SCRIPT_UPDATE') {
+        const saved = JSON.parse(JSON.stringify(msg.script));
+        evScripts = evScripts.map((x) => (x.id === saved.id ? saved : x));
+        return { ok: true, script: saved };
+      }
+      return { ok: true };
+    },
+  });
+  boundListeners.clear();
+  nodes.clear();
+  await loadPopup();
+  await sleep(300);
+
+  const evClick = boundListeners.get('#list').click;
+  const evChange = boundListeners.get('#list').change;
+  const mkClick = (map) => ({
+    target: { closest: (sel) => map[sel] ?? null, matches: () => false, dataset: {} },
+    stopPropagation() {},
+    preventDefault() {},
+  });
+  const CARD1 = { dataset: { id: 's1' } };
+
+  await evClick(mkClick({ '.card': CARD1, '[data-act]': { dataset: { act: 'toggle' } } }));
+  await sleep(80);
+
+  let evHtml = nodes.get('#list').__state?.innerHTML || '';
+  check('展开后能看到事件组', evHtml.includes('事件组'), evHtml.slice(0, 160));
+  check('事件带类型徽标', evHtml.includes('ev-kind gesture'), evHtml.slice(0, 220));
+  check('事件可单独命名', evHtml.includes('data-evd="name"'));
+  check('事件可配等待条件', evHtml.includes('data-evd="wait-url"') && evHtml.includes('data-evd="wait-selector"'));
+  check('有「＋ 手势」和「＋ JS」', evHtml.includes('data-act="add-gesture"') && evHtml.includes('data-act="add-js"'));
+  check('卡片副标题改成显示事件数与步数', evHtml.includes('1 个事件') && evHtml.includes('1 步'), evHtml.slice(0, 400));
+
+  // ---- 新增 JS 事件 ----
+  sendMessageCalls.length = 0;
+  await evClick(mkClick({ '.card': CARD1, '[data-act]': { dataset: { act: 'add-js' } } }));
+  await sleep(160);
+  let evUpd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
+  check('「＋ JS」新增了一个 JS 事件',
+    evUpd?.script?.events?.length === 2 && evUpd.script.events[1].type === 'js',
+    JSON.stringify(evUpd?.script?.events?.map((e) => e.type)));
+  check('新事件自带默认等待条件',
+    evUpd?.script?.events?.[1]?.wait?.timeoutSec === 20,
+    JSON.stringify(evUpd?.script?.events?.[1]?.wait));
+
+  // ---- 排序 ----
+  sendMessageCalls.length = 0;
+  await evClick(mkClick({ '.card': CARD1, '[data-evd]': { dataset: { evd: 'ev-up', ev: '1' } } }));
+  await sleep(160);
+  evUpd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
+  check('事件上移后顺序真的变了',
+    evUpd?.script?.events?.[0]?.type === 'js',
+    JSON.stringify(evUpd?.script?.events?.map((e) => e.type)));
+
+  // ---- 删除要点两下 ----
+  const delBtn = { dataset: { evd: 'ev-del', ev: '0' }, classList: { add() {} }, textContent: '' };
+  const delClick = () => mkClick({ '.card': CARD1, '[data-evd]': delBtn });
+
+  sendMessageCalls.length = 0;
+  await evClick(delClick());
+  await sleep(90);
+  check('第一下只标记确认，不真删',
+    sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').length === 0);
+  check('按钮变成确认文案，用户知道要再点一下', delBtn.textContent === '确认删除');
+
+  sendMessageCalls.length = 0;
+  await evClick(delClick());
+  await sleep(160);
+  evUpd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
+  check('第二下才真的删掉', evUpd?.script?.events?.length === 1, JSON.stringify(evUpd?.script?.events?.length));
+
+  // ---- 等待条件 ----
+  sendMessageCalls.length = 0;
+  await evChange({
+    target: {
+      matches: (s) => s === undefined,
+      closest: () => CARD1,
+      dataset: { evd: 'wait-selector', ev: '0' },
+      value: '#app-ready',
+      type: 'text',
+    },
+    stopPropagation() {},
+    preventDefault() {},
+  });
+  await sleep(160);
+  evUpd = sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
+  check('事件级「等元素」写进了事件',
+    evUpd?.script?.events?.[0]?.wait?.selector === '#app-ready',
+    JSON.stringify(evUpd?.script?.events?.[0]?.wait));
+
+  // ---- 匹配条件：开关 / 快捷 chip / 清除 ----
+  const stepHost = { dataset: { ei: '0', si: '0' } };
+  const matchOf = (m) => m?.script?.events?.[0]?.steps?.[0]?.match;
+  let chipErr = null;
+  const stepClick = async (map) => {
+    sendMessageCalls.length = 0;
+    try {
+      await evClick(mkClick({ '.card': CARD1, '.step': stepHost, ...map }));
+      await sleep(170);
+    } catch (e) {
+      chipErr = e;
+    }
+    return sendMessageCalls.filter((m) => m.type === 'SCRIPT_UPDATE').pop();
+  };
+
+  // 1) 开关：还没条件时，用录制快照给个起点，省得对着空框发呆
+  evUpd = await stepClick({
+    '[data-toggle-match]': { dataset: { toggleMatch: '0', ev: '0' }, closest: () => stepHost },
+  });
+  check('点「＋⌕」时用录制快照给个起点（不用自己回页面抄选择器）',
+    !chipErr && matchOf(evUpd) === '.green', chipErr?.stack || JSON.stringify(matchOf(evUpd)));
+
+  // 2) 快捷 chip：把 class / 属性拼进去
+  evUpd = await stepClick({
+    '[data-match-add]': { dataset: { matchAdd: '[href]' }, closest: () => stepHost },
+  });
+  check('点快捷 chip 把条件追加进去', !chipErr && matchOf(evUpd) === '.green[href]',
+    chipErr?.stack || JSON.stringify(matchOf(evUpd)));
+
+  // 3) 清除
+  evUpd = await stepClick({
+    '[data-clear-match]': { dataset: { clearMatch: '0', ev: '0' }, closest: () => stepHost },
+  });
+  check('点 ✕ 清掉匹配条件', !chipErr && matchOf(evUpd) === '',
+    chipErr?.stack || JSON.stringify(matchOf(evUpd)));
+
+
   report();
 }
+
+const EV_WAIT = { url: '', selector: '', timeoutSec: 20 };
 
 function makeScriptFixture(steps) {
   return {
     id: 's1',
     name: '测试脚本',
     targetUrl: 'https://example.com/app',
-    steps,
+    events: [{ id: 'ev1', name: '手势', type: 'gesture', enabled: true, wait: { ...EV_WAIT }, steps }],
     engine: null,
     enabled: true,
     schedule: { enabled: false, mode: 'interval', everySec: 1800, time: '09:30', domains: [] },

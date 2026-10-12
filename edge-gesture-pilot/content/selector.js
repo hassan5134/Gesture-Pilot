@@ -92,6 +92,36 @@
     return { kind: 'css', value: cssPath(el), tag };
   }
 
+  /**
+   * 录制时顺手记下元素特征，供事后加固定位条件用。
+   *
+   * 只存 class 名和属性名（不是完整快照），体积很小，但足够在编辑界面上
+   * 一键把「.green」「[href]」这类条件拼出来。没有它，用户就得自己回页面
+   * 开 DevTools 抄选择器 —— 那这个功能基本没人会去用。
+   */
+  function elementHints(el) {
+    if (!el || el.nodeType !== 1) return null;
+    try {
+      const cls = Array.from(el.classList || [])
+        .filter((c) => c && c.length <= 40 && !VOLATILE_ID.test(c))
+        .slice(0, 8);
+
+      // 只留那些有语义、能当条件的属性；style / 随机 data 属性留着是噪声
+      const KEEP = ['href', 'name', 'type', 'role', 'title', 'alt', 'placeholder', 'value', 'for', 'target'];
+      const attrs = [];
+      for (const a of Array.from(el.attributes || [])) {
+        if (a.name === 'class' || a.name === 'style' || a.name === 'id') continue;
+        if (!KEEP.includes(a.name) && !/^(data-|aria-)/.test(a.name)) continue;
+        attrs.push({ name: a.name, value: String(a.value).slice(0, 60) });
+        if (attrs.length >= 12) break;
+      }
+
+      return { tag: el.tagName.toLowerCase(), cls, attrs };
+    } catch {
+      return null;
+    }
+  }
+
   function describeLocator(loc) {
     if (!loc) return '（空定位器）';
     if (loc.kind === 'css') return loc.value;
@@ -102,24 +132,80 @@
 
   /* ---------------- 解析定位器 ---------------- */
 
-  function resolve(root, loc) {
+  /**
+   * 步骤级「额外匹配条件」。
+   *
+   * 录制出来的定位器是自动挑的，遇到同名按钮、列表里结构一样的行就容易点错。
+   * 这里允许人工补一条 CSS 选择器来加固，例如：
+   *   .green         class 里有 green
+   *   [href]         必须有 href 属性
+   *   a.green[href^="/detail"]   几个条件叠加
+   *   :not(.disabled)
+   *
+   * 校验不通过就当作「这个候选不是目标」，继续等 —— 于是有了重试的机会，
+   * 而不是一上来就点到错的元素。
+   */
+  function matchesExtra(el, extra) {
+    const s = String(extra || '').trim();
+    if (!s) return true;
+    if (!el || el.nodeType !== 1) return false;
+    try {
+      return el.matches(s);
+    } catch {
+      return false;
+    }
+  }
+
+  /** 选择器语法是否合法（写错了要让用户立刻看到，而不是表现成「找不到元素」） */
+  function isValidSelector(s) {
+    const t = String(s || '').trim();
+    if (!t) return true;
+    try {
+      document.createDocumentFragment().querySelector(t);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 在候选里挑第一个满足额外条件的 */
+  function pick(scope, selector, extra) {
+    let list;
+    try {
+      list = scope.querySelectorAll(selector);
+    } catch {
+      return null;
+    }
+    for (const el of list) {
+      if (matchesExtra(el, extra)) return el;
+    }
+    return null;
+  }
+
+  function resolve(root, loc, extra) {
     if (!loc) return null;
     const scope = root || document;
+    const ok = (el) => el && matchesExtra(el, extra);
+
     try {
-      if (loc.kind === 'css') return scope.querySelector(loc.value);
+      if (loc.kind === 'css') {
+        // 有条件时必须逐个筛，querySelector 只给第一个，可能正好是不该点的那个
+        if (extra) return pick(scope, loc.value, extra);
+        return scope.querySelector(loc.value);
+      }
 
       if (loc.kind === 'attr') {
         const sel = `${loc.tag || '*'}${loc.attr ? `[${loc.attr}="${attrEscape(loc.value)}"]` : ''}`;
-        const hit = scope.querySelector(sel);
+        const hit = extra ? pick(scope, sel, extra) : scope.querySelector(sel);
         if (hit) return hit;
         // 属性值被运行时改写时，退化为「属性存在 + 文本相近」
         const loose = Array.from(scope.querySelectorAll(`${loc.tag || '*'}[${loc.attr}]`));
-        return loose.find((el) => visibleText(el).includes(loc.value)) || null;
+        return loose.find((el) => ok(el) && visibleText(el).includes(loc.value)) || null;
       }
 
       if (loc.kind === 'aria') {
         const sel = loc.tag || 'button,a,[role="button"],input,textarea,select';
-        const cands = Array.from(scope.querySelectorAll(sel));
+        const cands = Array.from(scope.querySelectorAll(sel)).filter(ok);
         return (
           cands.find((el) => labelOf(el) === loc.value) ||
           cands.find((el) => visibleText(el) === loc.value) ||
@@ -136,10 +222,10 @@
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  async function waitFor(loc, timeout = 8000, root) {
+  async function waitFor(loc, timeout = 8000, root, extra) {
     const deadline = Date.now() + timeout;
     for (;;) {
-      const el = resolve(root, loc);
+      const el = resolve(root, loc, extra);
       if (el && isVisible(el)) return el;
       if (Date.now() >= deadline) return el || null; // 存在但不可见时也返回，交给调用方判断
       await sleep(120);
@@ -283,6 +369,9 @@
     describeLocator,
     resolve,
     waitFor,
+    matchesExtra,
+    isValidSelector,
+    elementHints,
     isVisible,
     clientPointAt,
     localPointAt,

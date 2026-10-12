@@ -59,6 +59,11 @@ function send(tabId, method, params = {}) {
   return chrome.debugger.sendCommand({ tabId }, method, params);
 }
 
+/** 通用命令出口：lib/jsruntime.js 用 Runtime.evaluate 执行用户脚本 */
+export function sendCommand(tabId, method, params = {}) {
+  return send(tabId, method, params);
+}
+
 /**
  * 拖拽：按下 → 沿路径移动（buttons 必须为 1）→ 抬起。
  * points 用的是顶层视口坐标。
